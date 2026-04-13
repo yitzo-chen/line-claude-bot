@@ -174,6 +174,11 @@ def handle_command(user_id: str, text: str) -> str | None:
     return None
 
 
+@app.route("/health", methods=["GET"])
+def health():
+    return {"status": "ok", "known_users": len(known_users), "conversations": len(conversation_history)}
+
+
 @app.route("/push", methods=["POST"])
 def push():
     """Claude 主動推播訊息給使用者"""

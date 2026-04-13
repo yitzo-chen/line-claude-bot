@@ -3,3 +3,4 @@ line-bot-sdk>=3.11.0
 groq>=0.11.0
 requests>=2.32.0
 pypdf>=4.0.0
+gunicorn>=21.0.0
