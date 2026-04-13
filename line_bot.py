@@ -77,8 +77,10 @@ def ask_gemini_once(parts: list) -> str:
     return response.text
 
 
-@app.route("/callback", methods=["POST"])
+@app.route("/callback", methods=["GET", "POST"])
 def callback():
+    if request.method == "GET":
+        return "OK"
     signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
     try:
