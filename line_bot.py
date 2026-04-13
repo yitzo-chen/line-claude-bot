@@ -176,7 +176,12 @@ def handle_command(user_id: str, text: str) -> str | None:
 
 @app.route("/health", methods=["GET"])
 def health():
-    return {"status": "ok", "known_users": len(known_users), "conversations": len(conversation_history)}
+    return {
+        "status": "ok",
+        "known_users": len(known_users),
+        "conversations": len(conversation_history),
+        "last_webhook": app.config.get("last_webhook", {})
+    }
 
 
 @app.route("/push", methods=["POST"])
@@ -215,10 +220,15 @@ def callback():
         return "OK"
     signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
+    # 記錄最後一筆 webhook（debug 用）
+    app.config["last_webhook"] = {"sig": signature[:20] if signature else "none", "body": body[:300]}
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
+        app.config["last_webhook"]["error"] = "InvalidSignature"
         abort(400)
+    except Exception as e:
+        app.config["last_webhook"]["error"] = str(e)[:200]
     return "OK"
 
 
