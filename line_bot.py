@@ -37,6 +37,7 @@ VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 WHISPER_MODEL = "whisper-large-v3-turbo"
 
 conversation_history: dict[str, list] = {}
+known_users: set[str] = {}  # 記錄所有傳過訊息的 user_id
 
 HELP_TEXT = """🤖 AI 助理指令說明
 
@@ -168,6 +169,36 @@ def handle_command(user_id: str, text: str) -> str | None:
     return None
 
 
+@app.route("/push", methods=["POST"])
+def push():
+    """Claude 主動推播訊息給使用者"""
+    token = request.headers.get("X-Push-Token", "")
+    if token != os.environ.get("PUSH_TOKEN", ""):
+        abort(403)
+    data = request.get_json()
+    user_id = data.get("user_id")
+    text = data.get("text", "")
+    if not user_id or not text:
+        return {"error": "missing user_id or text"}, 400
+    with ApiClient(configuration) as api_client:
+        line_api = MessagingApi(api_client)
+        from linebot.v3.messaging import PushMessageRequest
+        line_api.push_message(PushMessageRequest(
+            to=user_id,
+            messages=[TextMessage(text=text[:5000])],
+        ))
+    return {"ok": True}
+
+
+@app.route("/users", methods=["GET"])
+def get_users():
+    """取得所有已知 user_id（需要 token）"""
+    token = request.headers.get("X-Push-Token", "")
+    if token != os.environ.get("PUSH_TOKEN", ""):
+        abort(403)
+    return {"users": list(known_users)}
+
+
 @app.route("/callback", methods=["GET", "POST"])
 def callback():
     if request.method == "GET":
@@ -184,6 +215,7 @@ def callback():
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_text(event: MessageEvent):
     user_id = event.source.user_id
+    known_users.add(user_id)
     text = event.message.text
     try:
         cmd_result = handle_command(user_id, text)
