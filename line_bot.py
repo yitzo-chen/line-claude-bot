@@ -100,8 +100,11 @@ def handle_text(event: MessageEvent):
         reply(event.reply_token, "對話已重置。")
         return
 
-    answer = ask_gemini_text(user_id, text)
-    reply(event.reply_token, answer)
+    try:
+        answer = ask_gemini_text(user_id, text)
+        reply(event.reply_token, answer)
+    except Exception as e:
+        reply(event.reply_token, f"[錯誤] {type(e).__name__}: {str(e)[:200]}")
 
 
 @handler.add(MessageEvent, message=ImageMessageContent)
