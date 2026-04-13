@@ -1,5 +1,4 @@
 import os
-import tempfile
 import requests
 from flask import Flask, request, abort
 from linebot.v3 import WebhookHandler
@@ -17,7 +16,7 @@ from linebot.v3.webhooks import (
     ImageMessageContent,
     FileMessageContent,
 )
-import anthropic
+import google.generativeai as genai
 import base64
 
 app = Flask(__name__)
@@ -25,14 +24,16 @@ app = Flask(__name__)
 # 環境變數
 LINE_CHANNEL_ACCESS_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
 LINE_CHANNEL_SECRET = os.environ["LINE_CHANNEL_SECRET"]
-ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
 configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
-claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-# 每個使用者的對話歷史（簡易版，重啟後清空）
-conversation_history: dict[str, list] = {}
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel("gemini-1.5-flash")
+
+# 每個使用者的對話歷史（重啟後清空）
+chat_sessions: dict[str, any] = {}
 
 
 def get_line_file(message_id: str) -> bytes:
@@ -51,29 +52,29 @@ def reply(reply_token: str, text: str):
         line_api.reply_message(
             ReplyMessageRequest(
                 reply_token=reply_token,
-                messages=[TextMessage(text=text[:5000])],  # LINE 單則上限 5000 字
+                messages=[TextMessage(text=text[:5000])],
             )
         )
 
 
-def ask_claude(user_id: str, messages: list) -> str:
-    """呼叫 Claude API，維持對話歷史"""
-    history = conversation_history.setdefault(user_id, [])
-    history.extend(messages)
+def get_chat(user_id: str):
+    """取得或建立使用者的 chat session"""
+    if user_id not in chat_sessions:
+        chat_sessions[user_id] = model.start_chat(history=[])
+    return chat_sessions[user_id]
 
-    # 保留最近 20 則，避免 token 過多
-    if len(history) > 20:
-        history = history[-20:]
-        conversation_history[user_id] = history
 
-    response = claude.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=2048,
-        messages=history,
-    )
-    assistant_text = response.content[0].text
-    history.append({"role": "assistant", "content": assistant_text})
-    return assistant_text
+def ask_gemini_text(user_id: str, text: str) -> str:
+    """文字對話，維持歷史"""
+    chat = get_chat(user_id)
+    response = chat.send_message(text)
+    return response.text
+
+
+def ask_gemini_once(parts: list) -> str:
+    """單次問答（圖片/PDF），不維持歷史"""
+    response = model.generate_content(parts)
+    return response.text
 
 
 @app.route("/callback", methods=["POST"])
@@ -92,41 +93,32 @@ def handle_text(event: MessageEvent):
     user_id = event.source.user_id
     text = event.message.text
 
-    # 清除對話歷史指令
     if text.strip() in ("/reset", "重置", "清除對話"):
-        conversation_history.pop(user_id, None)
+        chat_sessions.pop(user_id, None)
         reply(event.reply_token, "對話已重置。")
         return
 
-    messages = [{"role": "user", "content": text}]
-    answer = ask_claude(user_id, messages)
+    answer = ask_gemini_text(user_id, text)
     reply(event.reply_token, answer)
 
 
 @handler.add(MessageEvent, message=ImageMessageContent)
 def handle_image(event: MessageEvent):
-    user_id = event.source.user_id
     image_bytes = get_line_file(event.message.id)
-    b64 = base64.standard_b64encode(image_bytes).decode()
-
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "image/jpeg",
-                        "data": b64,
-                    },
-                },
-                {"type": "text", "text": "請分析這張圖片，用繁體中文說明內容。"},
-            ],
-        }
+    parts = [
+        {"mime_type": "image/jpeg", "data": base64.standard_b64encode(image_bytes).decode()},
+        "請分析這張圖片，用繁體中文說明內容。",
     ]
-    answer = ask_claude(user_id, messages)
-    reply(event.reply_token, answer)
+    # Gemini 需要用 inline_data 格式
+    import google.generativeai as genai2
+    img_part = genai2.protos.Part(
+        inline_data=genai2.protos.Blob(
+            mime_type="image/jpeg",
+            data=image_bytes,
+        )
+    )
+    response = model.generate_content([img_part, "請分析這張圖片，用繁體中文說明內容。"])
+    reply(event.reply_token, response.text)
 
 
 @handler.add(MessageEvent, message=FileMessageContent)
@@ -134,46 +126,29 @@ def handle_file(event: MessageEvent):
     user_id = event.source.user_id
     file_name = event.message.file_name or "file"
     file_bytes = get_line_file(event.message.id)
-
     ext = file_name.rsplit(".", 1)[-1].lower() if "." in file_name else ""
 
     if ext == "pdf":
-        # PDF：用 base64 傳給 Claude
-        b64 = base64.standard_b64encode(file_bytes).decode()
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "document",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "application/pdf",
-                            "data": b64,
-                        },
-                    },
-                    {"type": "text", "text": f"請閱讀這份 PDF（{file_name}），用繁體中文摘要重點內容。"},
-                ],
-            }
-        ]
+        import google.generativeai as genai2
+        pdf_part = genai2.protos.Part(
+            inline_data=genai2.protos.Blob(
+                mime_type="application/pdf",
+                data=file_bytes,
+            )
+        )
+        response = model.generate_content([pdf_part, f"請閱讀這份 PDF（{file_name}），用繁體中文摘要重點內容。"])
+        reply(event.reply_token, response.text)
+
     elif ext in ("txt", "csv", "md", "json", "xml", "py", "js", "ts", "html", "css"):
-        # 純文字類型：直接讀取內容
         try:
             text_content = file_bytes.decode("utf-8", errors="replace")
         except Exception:
             text_content = file_bytes.decode("big5", errors="replace")
-        messages = [
-            {
-                "role": "user",
-                "content": f"以下是檔案 `{file_name}` 的內容：\n\n{text_content}\n\n請用繁體中文分析並摘要重點。",
-            }
-        ]
+        answer = ask_gemini_text(user_id, f"以下是檔案 `{file_name}` 的內容：\n\n{text_content}\n\n請用繁體中文分析並摘要重點。")
+        reply(event.reply_token, answer)
+
     else:
         reply(event.reply_token, f"目前不支援 .{ext} 格式，支援：PDF、圖片、txt、csv、md、json 等文字類型檔案。")
-        return
-
-    answer = ask_claude(user_id, messages)
-    reply(event.reply_token, answer)
 
 
 if __name__ == "__main__":
