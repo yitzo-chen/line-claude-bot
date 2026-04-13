@@ -1,6 +1,8 @@
 import os
 import base64
 import requests
+import threading
+import time
 from flask import Flask, request, abort
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
@@ -286,6 +288,21 @@ def handle_file(event: MessageEvent):
         reply(event.reply_token, f"[錯誤] {type(e).__name__}: {str(e)[:200]}")
 
 
+def keep_alive():
+    """每 4 分鐘 ping 自己，防止 Render 免費版睡眠"""
+    service_url = os.environ.get("RENDER_EXTERNAL_URL", "")
+    if not service_url:
+        return
+    while True:
+        time.sleep(240)
+        try:
+            requests.get(f"{service_url}/callback", timeout=10)
+        except Exception:
+            pass
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
+    t = threading.Thread(target=keep_alive, daemon=True)
+    t.start()
     app.run(host="0.0.0.0", port=port)
