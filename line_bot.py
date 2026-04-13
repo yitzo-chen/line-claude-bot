@@ -146,6 +146,9 @@ def handle_command(user_id: str, text: str) -> str | None:
     if stripped in ("/help", "help", "說明", "指令"):
         return HELP_TEXT
 
+    if stripped == "/myid":
+        return f"你的 LINE User ID：\n{user_id}"
+
     if stripped in ("/reset", "重置", "清除對話"):
         conversation_history.pop(user_id, None)
         return "對話已重置。"
