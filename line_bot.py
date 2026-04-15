@@ -133,56 +133,70 @@ def handle_text(event: MessageEvent):
         reply(event.reply_token, "對話已重置。")
         return
 
-    messages = [{"role": "user", "content": text}]
-    answer = ask_groq(user_id, messages)
-    reply(event.reply_token, answer)
+    try:
+        messages = [{"role": "user", "content": text}]
+        answer = ask_groq(user_id, messages)
+        reply(event.reply_token, answer)
+    except Exception as e:
+        reply(event.reply_token, f"⚠️ 發生錯誤，請稍後再試。\n({type(e).__name__})")
 
 
 @handler.add(MessageEvent, message=ImageMessageContent)
 def handle_image(event: MessageEvent):
     user_id = event.source.user_id
-    image_bytes = get_line_file(event.message.id)
-    b64 = base64.standard_b64encode(image_bytes).decode()
-
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
-                },
-                {"type": "text", "text": "請分析這張圖片，用繁體中文說明內容。"},
-            ],
-        }
-    ]
-    answer = ask_groq(user_id, messages, model=VISION_MODEL)
-    reply(event.reply_token, answer)
+    try:
+        image_bytes = get_line_file(event.message.id)
+        # 限制圖片大小（5MB）
+        if len(image_bytes) > 5 * 1024 * 1024:
+            reply(event.reply_token, "⚠️ 圖片過大（超過 5MB），請壓縮後再傳。")
+            return
+        b64 = base64.standard_b64encode(image_bytes).decode()
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+                    },
+                    {"type": "text", "text": "請分析這張圖片，用繁體中文說明內容。"},
+                ],
+            }
+        ]
+        answer = ask_groq(user_id, messages, model=VISION_MODEL)
+        reply(event.reply_token, answer)
+    except Exception as e:
+        reply(event.reply_token, f"⚠️ 圖片處理失敗，請稍後再試。\n({type(e).__name__})")
 
 
 @handler.add(MessageEvent, message=FileMessageContent)
 def handle_file(event: MessageEvent):
     user_id = event.source.user_id
     file_name = event.message.file_name or "file"
-    file_bytes = get_line_file(event.message.id)
+    try:
+        file_bytes = get_line_file(event.message.id)
+        ext = file_name.rsplit(".", 1)[-1].lower() if "." in file_name else ""
 
-    ext = file_name.rsplit(".", 1)[-1].lower() if "." in file_name else ""
-
-    if ext in ("txt", "csv", "md", "json", "xml", "py", "js", "ts", "html", "css"):
-        try:
-            text_content = file_bytes.decode("utf-8", errors="replace")
-        except Exception:
-            text_content = file_bytes.decode("big5", errors="replace")
-        messages = [
-            {
-                "role": "user",
-                "content": f"以下是檔案 `{file_name}` 的內容：\n\n{text_content}\n\n請用繁體中文分析並摘要重點。",
-            }
-        ]
-        answer = ask_groq(user_id, messages)
-        reply(event.reply_token, answer)
-    else:
-        reply(event.reply_token, f"目前不支援 .{ext} 格式，支援：圖片、txt、csv、md、json 等文字類型檔案。")
+        if ext in ("txt", "csv", "md", "json", "xml", "py", "js", "ts", "html", "css"):
+            try:
+                text_content = file_bytes.decode("utf-8", errors="replace")
+            except Exception:
+                text_content = file_bytes.decode("big5", errors="replace")
+            # 限制文字長度（約 8000 字元）
+            if len(text_content) > 8000:
+                text_content = text_content[:8000] + "\n...(內容過長，已截斷)"
+            messages = [
+                {
+                    "role": "user",
+                    "content": f"以下是檔案 `{file_name}` 的內容：\n\n{text_content}\n\n請用繁體中文分析並摘要重點。",
+                }
+            ]
+            answer = ask_groq(user_id, messages)
+            reply(event.reply_token, answer)
+        else:
+            reply(event.reply_token, f"目前不支援 .{ext} 格式，支援：圖片、txt、csv、md、json 等文字類型檔案。")
+    except Exception as e:
+        reply(event.reply_token, f"⚠️ 檔案處理失敗，請稍後再試。\n({type(e).__name__})")
 
 
 if __name__ == "__main__":
