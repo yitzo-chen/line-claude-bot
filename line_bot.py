@@ -1,4 +1,5 @@
 import os
+import re
 import threading
 import requests
 import base64
@@ -27,6 +28,7 @@ app = Flask(__name__)
 LINE_CHANNEL_ACCESS_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
 LINE_CHANNEL_SECRET = os.environ["LINE_CHANNEL_SECRET"]
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
+OPENWEATHER_API_KEY = os.environ.get("OPENWEATHER_API_KEY", "")
 
 configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
@@ -47,6 +49,52 @@ SYSTEM_PROMPT = (
 
 # 每個使用者的對話歷史（簡易版，重啟後清空）
 conversation_history: dict[str, list] = {}
+
+WEATHER_KEYWORDS = ["天氣", "氣溫", "溫度", "下雨", "幾度", "晴天", "陰天", "weather", "temperature"]
+
+
+def is_weather_query(text: str) -> bool:
+    return any(kw in text.lower() for kw in WEATHER_KEYWORDS)
+
+
+def extract_city(text: str) -> str | None:
+    patterns = [
+        r'(.+?)(?:的)?(?:天氣|氣溫|溫度|幾度|下雨)',
+        r'(?:weather|temperature)\s+(?:in|at|of)\s+(.+)',
+        r'(.+?)\s+(?:weather|temperature)',
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text, re.IGNORECASE)
+        if m:
+            city = m.group(1).strip()
+            city = re.sub(r'^(幫我查|查一下|查|請問|請|告訴我|現在|今天|明天)', '', city).strip()
+            if city:
+                return city
+    return None
+
+
+def get_weather(city: str) -> str:
+    if not OPENWEATHER_API_KEY:
+        return "⚠️ 未設定 OPENWEATHER_API_KEY，無法查詢天氣。"
+    try:
+        resp = requests.get(
+            "https://api.openweathermap.org/data/2.5/weather",
+            params={"q": city, "appid": OPENWEATHER_API_KEY, "units": "metric", "lang": "zh_tw"},
+            timeout=10,
+        )
+        if resp.status_code == 404:
+            return f"找不到城市「{city}」，請確認城市名稱（建議用英文，例如 Taipei、Tokyo）。"
+        resp.raise_for_status()
+        d = resp.json()
+        return (
+            f"城市：{d['name']}\n"
+            f"天氣：{d['weather'][0]['description']}\n"
+            f"氣溫：{d['main']['temp']}°C（體感 {d['main']['feels_like']}°C）\n"
+            f"濕度：{d['main']['humidity']}%\n"
+            f"風速：{d['wind']['speed']} m/s"
+        )
+    except Exception as e:
+        return f"查詢天氣失敗：{e}"
 
 
 def get_line_file(message_id: str) -> bytes:
@@ -163,7 +211,15 @@ def handle_text(event: MessageEvent):
 
     def process():
         try:
-            messages = [{"role": "user", "content": text}]
+            content = text
+            if is_weather_query(text):
+                city = extract_city(text)
+                if not city:
+                    push(user_id, "請告訴我你想查哪個城市的天氣？")
+                    return
+                weather_info = get_weather(city)
+                content = f"{text}\n\n[即時天氣資料]\n{weather_info}"
+            messages = [{"role": "user", "content": content}]
             answer = ask_groq(user_id, messages)
             push(user_id, answer)
         except Exception as e:
