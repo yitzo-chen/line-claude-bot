@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import time
 import threading
 import requests
@@ -30,6 +31,16 @@ LINE_CHANNEL_ACCESS_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
 LINE_CHANNEL_SECRET = os.environ["LINE_CHANNEL_SECRET"]
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 OPENWEATHER_API_KEY = os.environ.get("OPENWEATHER_API_KEY", "")
+
+# Redis（設定 REDIS_URL 時啟用持久化歷史，否則退回 in-memory）
+redis_client = None
+if _redis_url := os.environ.get("REDIS_URL"):
+    try:
+        import redis as _redis
+        redis_client = _redis.from_url(_redis_url, decode_responses=True)
+        redis_client.ping()
+    except Exception:
+        redis_client = None
 
 configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
@@ -77,6 +88,90 @@ def cleanup_expired():
     for uid in expired:
         conversation_history.pop(uid, None)
         conversation_last_active.pop(uid, None)
+
+
+# ── History helpers（Redis 或 in-memory）────────────────────────────────────
+
+def get_history(user_id: str) -> list:
+    if redis_client:
+        try:
+            data = redis_client.get(f"hist:{user_id}")
+            return json.loads(data) if data else []
+        except Exception:
+            pass
+    return conversation_history.get(user_id, [])
+
+
+def save_history(user_id: str, history: list):
+    if redis_client:
+        try:
+            redis_client.set(f"hist:{user_id}", json.dumps(history, ensure_ascii=False), ex=HISTORY_TTL)
+            return
+        except Exception:
+            pass
+    conversation_history[user_id] = history
+    conversation_last_active[user_id] = time.time()
+
+
+# ── 對話摘要壓縮 ──────────────────────────────────────────────────────────────
+
+def compress_history(history: list) -> list:
+    """歷史超過上限時，將舊訊息摘要為一段背景，保留近期對話"""
+    if len(history) <= HISTORY_LIMIT:
+        return history
+
+    keep = HISTORY_LIMIT // 2
+    old, recent = history[:-keep], history[-keep:]
+
+    convo = "\n".join(
+        f"{'使用者' if m['role'] == 'user' else '助理'}：{str(m['content'])[:200]}"
+        for m in old
+    )
+    try:
+        resp = groq_client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            max_tokens=150,
+            messages=[
+                {"role": "system", "content": "用1-2句話摘要以下對話重點，繁體中文。"},
+                {"role": "user", "content": convo},
+            ],
+        )
+        summary = resp.choices[0].message.content.strip()
+    except Exception:
+        summary = "（舊對話記錄）"
+
+    return [
+        {"role": "user", "content": f"[對話背景摘要] {summary}"},
+        {"role": "assistant", "content": "好的，我了解先前的對話背景。"},
+    ] + recent
+
+
+# ── Dynamic max_tokens ────────────────────────────────────────────────────────
+
+def calc_max_tokens(text: str) -> int:
+    length = len(text)
+    if length < 30:
+        return 512
+    elif length < 100:
+        return 1024
+    return 2048
+
+
+# ── Message deduplication ─────────────────────────────────────────────────────
+
+_processed_ids: dict[str, float] = {}
+_DEDUP_TTL = 60  # 60 秒內重複的 message_id 直接忽略
+
+
+def is_duplicate(message_id: str) -> bool:
+    now = time.time()
+    expired = [mid for mid, t in _processed_ids.items() if now - t > _DEDUP_TTL]
+    for mid in expired:
+        _processed_ids.pop(mid, None)
+    if message_id in _processed_ids:
+        return True
+    _processed_ids[message_id] = now
+    return False
 
 
 WEATHER_KEYWORDS = ["天氣", "氣溫", "溫度", "下雨", "幾度", "晴天", "陰天", "weather", "temperature"]
@@ -200,9 +295,10 @@ def ask_groq(user_id: str, messages: list, model: str = TEXT_MODEL, history_labe
     呼叫 Groq API，維持對話歷史。
     history_label: 存入歷史的簡化描述（None 則存 messages[0] 的完整 content）
     """
-    history = conversation_history.setdefault(user_id, [])
-    conversation_last_active[user_id] = time.time()
-    cleanup_expired()
+    history = get_history(user_id)
+    if not redis_client:
+        conversation_last_active[user_id] = time.time()
+        cleanup_expired()
 
     if model == VISION_MODEL:
         api_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + messages
@@ -212,14 +308,13 @@ def ask_groq(user_id: str, messages: list, model: str = TEXT_MODEL, history_labe
         assistant_text = response.choices[0].message.content
         history.append({"role": "user", "content": history_label or "[傳送了一張圖片]"})
         history.append({"role": "assistant", "content": assistant_text})
+        save_history(user_id, history)
         return assistant_text
 
-    # 歷史只存簡化標籤，不存完整內容（天氣資料、檔案內文）
+    # 存簡化標籤到歷史，避免天氣資料/檔案內文永久佔用 token
     stored = history_label if history_label else messages[0]["content"]
     history.append({"role": "user", "content": stored})
-    if len(history) > HISTORY_LIMIT:
-        history = history[-HISTORY_LIMIT:]
-        conversation_history[user_id] = history
+    history = compress_history(history)  # 超過上限時自動摘要壓縮
 
     # 歷史（除最後一筆）過濾 list content，最後一筆用原始 messages
     filtered = []
@@ -236,11 +331,16 @@ def ask_groq(user_id: str, messages: list, model: str = TEXT_MODEL, history_labe
 
     api_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + filtered + messages
 
+    # 動態 max_tokens：根據訊息長度決定，避免短問題浪費配額
+    user_text = messages[0].get("content", "") if isinstance(messages[0].get("content"), str) else ""
+    max_tokens = calc_max_tokens(user_text)
+
     response = groq_client.chat.completions.create(
-        model=model, max_tokens=2048, messages=api_messages,
+        model=model, max_tokens=max_tokens, messages=api_messages,
     )
     assistant_text = response.choices[0].message.content
     history.append({"role": "assistant", "content": assistant_text})
+    save_history(user_id, history)
     return assistant_text
 
 
@@ -262,6 +362,8 @@ def callback():
 
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_text(event: MessageEvent):
+    if is_duplicate(event.message.id):
+        return
     user_id = event.source.user_id
     text = event.message.text.strip()
 
@@ -301,6 +403,8 @@ def handle_text(event: MessageEvent):
 
 @handler.add(MessageEvent, message=ImageMessageContent)
 def handle_image(event: MessageEvent):
+    if is_duplicate(event.message.id):
+        return
     user_id = event.source.user_id
     image_bytes = get_line_file(event.message.id)
     b64 = base64.standard_b64encode(image_bytes).decode()
@@ -329,6 +433,8 @@ def handle_image(event: MessageEvent):
 
 @handler.add(MessageEvent, message=FileMessageContent)
 def handle_file(event: MessageEvent):
+    if is_duplicate(event.message.id):
+        return
     user_id = event.source.user_id
     file_name = event.message.file_name or "file"
     file_bytes = get_line_file(event.message.id)
