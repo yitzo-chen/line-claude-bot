@@ -1,4 +1,5 @@
 import os
+import threading
 import requests
 import base64
 from flask import Flask, request, abort
@@ -9,6 +10,7 @@ from linebot.v3.messaging import (
     ApiClient,
     MessagingApi,
     ReplyMessageRequest,
+    PushMessageRequest,
     TextMessage,
 )
 from linebot.v3.webhooks import (
@@ -33,6 +35,13 @@ groq_client = Groq(api_key=GROQ_API_KEY)
 TEXT_MODEL = "llama-3.3-70b-versatile"
 VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 
+SYSTEM_PROMPT = (
+    "你是一個智慧助理，名叫 Yitzo Bot。\n"
+    "- 預設使用繁體中文回覆\n"
+    "- 回答簡潔扼要，必要時條列說明\n"
+    "- 若使用者用其他語言提問，以同語言回覆"
+)
+
 # 每個使用者的對話歷史（簡易版，重啟後清空）
 conversation_history: dict[str, list] = {}
 
@@ -47,12 +56,24 @@ def get_line_file(message_id: str) -> bytes:
 
 
 def reply(reply_token: str, text: str):
-    """回覆訊息給使用者"""
+    """快速回覆（用於即時指令，不呼叫 AI）"""
     with ApiClient(configuration) as api_client:
         line_api = MessagingApi(api_client)
         line_api.reply_message(
             ReplyMessageRequest(
                 reply_token=reply_token,
+                messages=[TextMessage(text=text[:5000])],
+            )
+        )
+
+
+def push(user_id: str, text: str):
+    """主動推送訊息（AI 回應使用，不受 30 秒 reply token 限制）"""
+    with ApiClient(configuration) as api_client:
+        line_api = MessagingApi(api_client)
+        line_api.push_message(
+            PushMessageRequest(
+                to=user_id,
                 messages=[TextMessage(text=text[:5000])],
             )
         )
@@ -64,10 +85,11 @@ def ask_groq(user_id: str, messages: list, model: str = TEXT_MODEL) -> str:
 
     if model == VISION_MODEL:
         # 視覺模型：不帶歷史（無法重送圖片），直接呼叫
+        api_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + messages
         response = groq_client.chat.completions.create(
             model=model,
             max_tokens=2048,
-            messages=messages,
+            messages=api_messages,
         )
         assistant_text = response.choices[0].message.content
         # 以文字佔位符存入歷史，避免 list content 污染後續文字對話
@@ -82,16 +104,19 @@ def ask_groq(user_id: str, messages: list, model: str = TEXT_MODEL) -> str:
         conversation_history[user_id] = history
 
     # 過濾掉歷史中殘留的 list content（例如舊圖片訊息）
-    api_messages = []
+    filtered = []
     for m in history:
         if isinstance(m.get("content"), list):
             text = " ".join(
                 p.get("text", "") for p in m["content"]
                 if isinstance(p, dict) and p.get("type") == "text"
             ) or "[圖片]"
-            api_messages.append({"role": m["role"], "content": text})
+            filtered.append({"role": m["role"], "content": text})
         else:
-            api_messages.append(m)
+            filtered.append(m)
+
+    # system prompt 插在最前面
+    api_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + filtered
 
     response = groq_client.chat.completions.create(
         model=model,
@@ -133,70 +158,74 @@ def handle_text(event: MessageEvent):
         reply(event.reply_token, "對話已重置。")
         return
 
-    try:
-        messages = [{"role": "user", "content": text}]
-        answer = ask_groq(user_id, messages)
-        reply(event.reply_token, answer)
-    except Exception as e:
-        reply(event.reply_token, f"⚠️ 發生錯誤，請稍後再試。\n({type(e).__name__})")
+    def process():
+        try:
+            messages = [{"role": "user", "content": text}]
+            answer = ask_groq(user_id, messages)
+            push(user_id, answer)
+        except Exception as e:
+            push(user_id, f"⚠️ 發生錯誤：{e}")
+
+    threading.Thread(target=process, daemon=True).start()
 
 
 @handler.add(MessageEvent, message=ImageMessageContent)
 def handle_image(event: MessageEvent):
     user_id = event.source.user_id
-    try:
-        image_bytes = get_line_file(event.message.id)
-        # 限制圖片大小（5MB）
-        if len(image_bytes) > 5 * 1024 * 1024:
-            reply(event.reply_token, "⚠️ 圖片過大（超過 5MB），請壓縮後再傳。")
-            return
-        b64 = base64.standard_b64encode(image_bytes).decode()
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
-                    },
-                    {"type": "text", "text": "請分析這張圖片，用繁體中文說明內容。"},
-                ],
-            }
-        ]
-        answer = ask_groq(user_id, messages, model=VISION_MODEL)
-        reply(event.reply_token, answer)
-    except Exception as e:
-        reply(event.reply_token, f"⚠️ 圖片處理失敗，請稍後再試。\n({type(e).__name__})")
+    image_bytes = get_line_file(event.message.id)
+    b64 = base64.standard_b64encode(image_bytes).decode()
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+                },
+                {"type": "text", "text": "請分析這張圖片，用繁體中文說明內容。"},
+            ],
+        }
+    ]
+    def process():
+        try:
+            answer = ask_groq(user_id, messages, model=VISION_MODEL)
+            push(user_id, answer)
+        except Exception as e:
+            push(user_id, f"⚠️ 發生錯誤：{e}")
+
+    threading.Thread(target=process, daemon=True).start()
 
 
 @handler.add(MessageEvent, message=FileMessageContent)
 def handle_file(event: MessageEvent):
     user_id = event.source.user_id
     file_name = event.message.file_name or "file"
-    try:
-        file_bytes = get_line_file(event.message.id)
-        ext = file_name.rsplit(".", 1)[-1].lower() if "." in file_name else ""
+    file_bytes = get_line_file(event.message.id)
 
-        if ext in ("txt", "csv", "md", "json", "xml", "py", "js", "ts", "html", "css"):
+    ext = file_name.rsplit(".", 1)[-1].lower() if "." in file_name else ""
+
+    if ext in ("txt", "csv", "md", "json", "xml", "py", "js", "ts", "html", "css"):
+        try:
+            text_content = file_bytes.decode("utf-8", errors="replace")
+        except Exception:
+            text_content = file_bytes.decode("big5", errors="replace")
+        messages = [
+            {
+                "role": "user",
+                "content": f"以下是檔案 `{file_name}` 的內容：\n\n{text_content}\n\n請用繁體中文分析並摘要重點。",
+            }
+        ]
+        def process():
             try:
-                text_content = file_bytes.decode("utf-8", errors="replace")
-            except Exception:
-                text_content = file_bytes.decode("big5", errors="replace")
-            # 限制文字長度（約 8000 字元）
-            if len(text_content) > 8000:
-                text_content = text_content[:8000] + "\n...(內容過長，已截斷)"
-            messages = [
-                {
-                    "role": "user",
-                    "content": f"以下是檔案 `{file_name}` 的內容：\n\n{text_content}\n\n請用繁體中文分析並摘要重點。",
-                }
-            ]
-            answer = ask_groq(user_id, messages)
-            reply(event.reply_token, answer)
-        else:
-            reply(event.reply_token, f"目前不支援 .{ext} 格式，支援：圖片、txt、csv、md、json 等文字類型檔案。")
-    except Exception as e:
-        reply(event.reply_token, f"⚠️ 檔案處理失敗，請稍後再試。\n({type(e).__name__})")
+                answer = ask_groq(user_id, messages)
+                push(user_id, answer)
+            except Exception as e:
+                push(user_id, f"⚠️ 發生錯誤：{e}")
+
+        threading.Thread(target=process, daemon=True).start()
+    else:
+        reply(event.reply_token, f"目前不支援 .{ext} 格式，支援：圖片、txt、csv、md、json 等文字類型檔案。")
 
 
 if __name__ == "__main__":
