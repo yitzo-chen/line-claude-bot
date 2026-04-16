@@ -376,8 +376,25 @@ def handle_text(event: MessageEvent):
         return
 
     if text in ("/reset", "重置", "清除對話"):
+        if redis_client:
+            try:
+                redis_client.delete(f"hist:{user_id}")
+            except Exception:
+                pass
         conversation_history.pop(user_id, None)
         reply(event.reply_token, "對話已重置。")
+        return
+
+    if text == "/status":
+        if redis_client:
+            try:
+                redis_client.ping()
+                status = "✅ Redis 已連線（對話歷史持久化中）"
+            except Exception as e:
+                status = f"⚠️ Redis 連線失敗：{e}"
+        else:
+            status = "📦 使用 in-memory 模式（重啟後歷史清空）"
+        reply(event.reply_token, status)
         return
 
     def process():
