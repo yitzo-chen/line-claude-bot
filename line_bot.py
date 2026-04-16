@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import threading
 import requests
 import base64
@@ -42,13 +43,41 @@ SYSTEM_PROMPT = (
     "規則（不可違反）：\n"
     "1. 永遠以「Yitzo Bot」自稱，不得聲稱自己是其他 AI 或其他名字\n"
     "2. 永遠使用繁體中文回覆，不得使用簡體中文\n"
-    "3. 回答簡潔扼要，必要時條列說明\n"
-    "4. 若使用者用其他語言提問，以同語言回覆（但仍不透露其他身份）\n"
-    "5. 不要透露你使用的底層模型或技術細節"
+    "3. 回覆長度控制在 400 字以內，除非使用者明確要求詳細說明\n"
+    "4. 回答簡潔扼要，必要時條列說明\n"
+    "5. 若使用者用其他語言提問，以同語言回覆（但仍不透露其他身份）\n"
+    "6. 不要透露你使用的底層模型或技術細節"
 )
 
-# 每個使用者的對話歷史（簡易版，重啟後清空）
+# 每個使用者的對話歷史（重啟後清空）
 conversation_history: dict[str, list] = {}
+conversation_last_active: dict[str, float] = {}
+HISTORY_LIMIT = 10
+HISTORY_TTL = 2 * 3600  # 2 小時無活動自動清除
+
+# 常見城市中英對照（命中直接用，不呼叫 Groq）
+CITY_MAP: dict[str, str] = {
+    "台北": "Taipei", "臺北": "Taipei", "新北": "New Taipei",
+    "台中": "Taichung", "臺中": "Taichung", "台南": "Tainan", "臺南": "Tainan",
+    "高雄": "Kaohsiung", "基隆": "Keelung", "新竹": "Hsinchu",
+    "東京": "Tokyo", "大阪": "Osaka", "京都": "Kyoto", "札幌": "Sapporo",
+    "北京": "Beijing", "上海": "Shanghai", "廣州": "Guangzhou", "深圳": "Shenzhen",
+    "香港": "Hong Kong", "澳門": "Macao",
+    "首爾": "Seoul", "釜山": "Busan",
+    "新加坡": "Singapore", "曼谷": "Bangkok", "吉隆坡": "Kuala Lumpur",
+    "紐約": "New York", "洛杉磯": "Los Angeles", "芝加哥": "Chicago",
+    "倫敦": "London", "巴黎": "Paris", "柏林": "Berlin", "羅馬": "Rome",
+    "雪梨": "Sydney", "墨爾本": "Melbourne",
+}
+
+
+def cleanup_expired():
+    now = time.time()
+    expired = [uid for uid, t in conversation_last_active.items() if now - t > HISTORY_TTL]
+    for uid in expired:
+        conversation_history.pop(uid, None)
+        conversation_last_active.pop(uid, None)
+
 
 WEATHER_KEYWORDS = ["天氣", "氣溫", "溫度", "下雨", "幾度", "晴天", "陰天", "weather", "temperature"]
 
@@ -74,10 +103,12 @@ def extract_city(text: str) -> str | None:
 
 
 def normalize_city(city: str) -> str:
-    """將城市名稱翻譯成英文，供 OpenWeatherMap 查詢使用"""
+    """將城市名稱翻譯成英文：先查本地對照表，未命中才呼叫 Groq"""
+    if city in CITY_MAP:
+        return CITY_MAP[city]
     try:
         resp = groq_client.chat.completions.create(
-            model=TEXT_MODEL,
+            model="llama-3.1-8b-instant",  # 用小模型節省 token
             max_tokens=20,
             messages=[
                 {"role": "system", "content": "Translate the city name to English. Reply with ONLY the English city name, nothing else."},
@@ -123,6 +154,23 @@ def get_line_file(message_id: str) -> bytes:
     return resp.content
 
 
+# Rate limiting：每位使用者每分鐘最多 10 則
+rate_limit_count: dict[str, list] = {}
+RATE_LIMIT = 10
+RATE_WINDOW = 60
+
+
+def check_rate_limit(user_id: str) -> bool:
+    """回傳 True 表示未超限，False 表示超限"""
+    now = time.time()
+    timestamps = rate_limit_count.setdefault(user_id, [])
+    rate_limit_count[user_id] = [t for t in timestamps if now - t < RATE_WINDOW]
+    if len(rate_limit_count[user_id]) >= RATE_LIMIT:
+        return False
+    rate_limit_count[user_id].append(now)
+    return True
+
+
 def reply(reply_token: str, text: str):
     """快速回覆（用於即時指令，不呼叫 AI）"""
     with ApiClient(configuration) as api_client:
@@ -147,49 +195,49 @@ def push(user_id: str, text: str):
         )
 
 
-def ask_groq(user_id: str, messages: list, model: str = TEXT_MODEL) -> str:
-    """呼叫 Groq API，維持對話歷史"""
+def ask_groq(user_id: str, messages: list, model: str = TEXT_MODEL, history_label: str | None = None) -> str:
+    """
+    呼叫 Groq API，維持對話歷史。
+    history_label: 存入歷史的簡化描述（None 則存 messages[0] 的完整 content）
+    """
     history = conversation_history.setdefault(user_id, [])
+    conversation_last_active[user_id] = time.time()
+    cleanup_expired()
 
     if model == VISION_MODEL:
-        # 視覺模型：不帶歷史（無法重送圖片），直接呼叫
         api_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + messages
         response = groq_client.chat.completions.create(
-            model=model,
-            max_tokens=2048,
-            messages=api_messages,
+            model=model, max_tokens=2048, messages=api_messages,
         )
         assistant_text = response.choices[0].message.content
-        # 以文字佔位符存入歷史，避免 list content 污染後續文字對話
-        history.append({"role": "user", "content": "[傳送了一張圖片]"})
+        history.append({"role": "user", "content": history_label or "[傳送了一張圖片]"})
         history.append({"role": "assistant", "content": assistant_text})
         return assistant_text
 
-    # 文字模型：帶入歷史
-    history.extend(messages)
-    if len(history) > 20:
-        history = history[-20:]
+    # 歷史只存簡化標籤，不存完整內容（天氣資料、檔案內文）
+    stored = history_label if history_label else messages[0]["content"]
+    history.append({"role": "user", "content": stored})
+    if len(history) > HISTORY_LIMIT:
+        history = history[-HISTORY_LIMIT:]
         conversation_history[user_id] = history
 
-    # 過濾掉歷史中殘留的 list content（例如舊圖片訊息）
+    # 歷史（除最後一筆）過濾 list content，最後一筆用原始 messages
     filtered = []
-    for m in history:
-        if isinstance(m.get("content"), list):
+    for m in history[:-1]:
+        content = m.get("content")
+        if isinstance(content, list):
             text = " ".join(
-                p.get("text", "") for p in m["content"]
+                p.get("text", "") for p in content
                 if isinstance(p, dict) and p.get("type") == "text"
             ) or "[圖片]"
             filtered.append({"role": m["role"], "content": text})
         else:
             filtered.append(m)
 
-    # system prompt 插在最前面
-    api_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + filtered
+    api_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + filtered + messages
 
     response = groq_client.chat.completions.create(
-        model=model,
-        max_tokens=2048,
-        messages=api_messages,
+        model=model, max_tokens=2048, messages=api_messages,
     )
     assistant_text = response.choices[0].message.content
     history.append({"role": "assistant", "content": assistant_text})
@@ -217,6 +265,10 @@ def handle_text(event: MessageEvent):
     user_id = event.source.user_id
     text = event.message.text.strip()
 
+    if not check_rate_limit(user_id):
+        reply(event.reply_token, "⚠️ 你傳送太快了，請稍等一下再試。")
+        return
+
     if text == "/myid":
         reply(event.reply_token, f"你的 LINE User ID：\n{user_id}")
         return
@@ -229,6 +281,7 @@ def handle_text(event: MessageEvent):
     def process():
         try:
             content = text
+            label = None
             if is_weather_query(text):
                 city = extract_city(text)
                 if not city:
@@ -236,8 +289,9 @@ def handle_text(event: MessageEvent):
                     return
                 weather_info = get_weather(city)
                 content = f"{text}\n\n[即時天氣資料]\n{weather_info}"
+                label = f"[查詢了 {city} 的天氣]"
             messages = [{"role": "user", "content": content}]
-            answer = ask_groq(user_id, messages)
+            answer = ask_groq(user_id, messages, history_label=label)
             push(user_id, answer)
         except Exception as e:
             push(user_id, f"⚠️ 發生錯誤：{e}")
@@ -294,7 +348,7 @@ def handle_file(event: MessageEvent):
         ]
         def process():
             try:
-                answer = ask_groq(user_id, messages)
+                answer = ask_groq(user_id, messages, history_label=f"[分析了檔案 {file_name}]")
                 push(user_id, answer)
             except Exception as e:
                 push(user_id, f"⚠️ 發生錯誤：{e}")
