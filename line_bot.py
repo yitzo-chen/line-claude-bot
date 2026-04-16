@@ -73,9 +73,26 @@ def extract_city(text: str) -> str | None:
     return None
 
 
+def normalize_city(city: str) -> str:
+    """將城市名稱翻譯成英文，供 OpenWeatherMap 查詢使用"""
+    try:
+        resp = groq_client.chat.completions.create(
+            model=TEXT_MODEL,
+            max_tokens=20,
+            messages=[
+                {"role": "system", "content": "Translate the city name to English. Reply with ONLY the English city name, nothing else."},
+                {"role": "user", "content": city},
+            ],
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception:
+        return city
+
+
 def get_weather(city: str) -> str:
     if not OPENWEATHER_API_KEY:
         return "⚠️ 未設定 OPENWEATHER_API_KEY，無法查詢天氣。"
+    city = normalize_city(city)
     try:
         resp = requests.get(
             "https://api.openweathermap.org/data/2.5/weather",
