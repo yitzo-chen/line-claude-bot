@@ -2,348 +2,216 @@ import os
 import re
 import json
 import time
-import threading
-import requests
 import base64
+import threading
+import subprocess
+import requests
 from flask import Flask, request, abort
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
-    Configuration,
-    ApiClient,
-    MessagingApi,
-    ReplyMessageRequest,
-    PushMessageRequest,
-    TextMessage,
+    Configuration, ApiClient, MessagingApi,
+    ReplyMessageRequest, PushMessageRequest, TextMessage,
 )
 from linebot.v3.webhooks import (
-    MessageEvent,
-    TextMessageContent,
-    ImageMessageContent,
-    FileMessageContent,
+    MessageEvent, TextMessageContent,
+    ImageMessageContent, FileMessageContent,
 )
-from groq import Groq
+import anthropic
 
 app = Flask(__name__)
 
-# 環境變數
+# ── 環境變數 ──────────────────────────────────────────────────────────────────
 LINE_CHANNEL_ACCESS_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
-LINE_CHANNEL_SECRET = os.environ["LINE_CHANNEL_SECRET"]
-GROQ_API_KEY = os.environ["GROQ_API_KEY"]
-OPENWEATHER_API_KEY = os.environ.get("OPENWEATHER_API_KEY", "")
+LINE_CHANNEL_SECRET       = os.environ["LINE_CHANNEL_SECRET"]
+ANTHROPIC_API_KEY         = os.environ["ANTHROPIC_API_KEY"]
+OWNER_USER_ID             = os.environ.get("LINE_USER_ID", "")
+OPENWEATHER_API_KEY       = os.environ.get("OPENWEATHER_API_KEY", "")
 
-# Redis（設定 REDIS_URL 時啟用持久化歷史，否則退回 in-memory）
-redis_client = None
-if _redis_url := os.environ.get("REDIS_URL"):
-    try:
-        import redis as _redis
-        redis_client = _redis.from_url(_redis_url, decode_responses=True)
-        redis_client.ping()
-    except Exception:
-        redis_client = None
+MODEL = "claude-sonnet-4-6"
 
-configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
-handler = WebhookHandler(LINE_CHANNEL_SECRET)
-groq_client = Groq(api_key=GROQ_API_KEY)
-
-TEXT_MODEL = "llama-3.3-70b-versatile"
-VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+configuration  = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
+handler        = WebhookHandler(LINE_CHANNEL_SECRET)
+claude_client  = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 SYSTEM_PROMPT = (
-    "你的名字是「Yitzo Bot」，你是 Yitzo 的私人智慧助理。\n"
-    "規則（不可違反）：\n"
-    "1. 永遠以「Yitzo Bot」自稱，不得聲稱自己是其他 AI 或其他名字\n"
-    "2. 永遠使用繁體中文回覆，不得使用簡體中文\n"
-    "3. 回覆長度控制在 400 字以內，除非使用者明確要求詳細說明\n"
-    "4. 回答簡潔扼要，必要時條列說明\n"
-    "5. 若使用者用其他語言提問，以同語言回覆（但仍不透露其他身份）\n"
-    "6. 不要透露你使用的底層模型或技術細節"
+    "你的名字是「Claude AI助理」，你是 Yitzo 的私人 AI 助理，由 Anthropic Claude 驅動。\n"
+    "規則：\n"
+    "1. 永遠用繁體中文回覆，除非對方用其他語言提問\n"
+    "2. 回覆控制在 500 字以內，除非使用者要求詳細\n"
+    "3. 回答簡潔扼要，必要時條列說明\n"
+    "4. 不透露底層技術細節"
 )
 
-# 每個使用者的對話歷史（重啟後清空）
+# ── 對話歷史（in-memory）────────────────────────────────────────────────────
 conversation_history: dict[str, list] = {}
-conversation_last_active: dict[str, float] = {}
-HISTORY_LIMIT = 10
-HISTORY_TTL = 2 * 3600  # 2 小時無活動自動清除
-
-# 常見城市中英對照（命中直接用，不呼叫 Groq）
-CITY_MAP: dict[str, str] = {
-    "台北": "Taipei", "臺北": "Taipei", "新北": "New Taipei",
-    "台中": "Taichung", "臺中": "Taichung", "台南": "Tainan", "臺南": "Tainan",
-    "高雄": "Kaohsiung", "基隆": "Keelung", "新竹": "Hsinchu",
-    "東京": "Tokyo", "大阪": "Osaka", "京都": "Kyoto", "札幌": "Sapporo",
-    "北京": "Beijing", "上海": "Shanghai", "廣州": "Guangzhou", "深圳": "Shenzhen",
-    "香港": "Hong Kong", "澳門": "Macao",
-    "首爾": "Seoul", "釜山": "Busan",
-    "新加坡": "Singapore", "曼谷": "Bangkok", "吉隆坡": "Kuala Lumpur",
-    "紐約": "New York", "洛杉磯": "Los Angeles", "芝加哥": "Chicago",
-    "倫敦": "London", "巴黎": "Paris", "柏林": "Berlin", "羅馬": "Rome",
-    "雪梨": "Sydney", "墨爾本": "Melbourne",
-}
+HISTORY_LIMIT = 12
+HISTORY_TTL   = 2 * 3600
+_last_active:  dict[str, float] = {}
 
 
-def cleanup_expired():
+def get_history(uid: str) -> list:
     now = time.time()
-    expired = [uid for uid, t in conversation_last_active.items() if now - t > HISTORY_TTL]
-    for uid in expired:
+    if uid in _last_active and now - _last_active[uid] > HISTORY_TTL:
         conversation_history.pop(uid, None)
-        conversation_last_active.pop(uid, None)
+    return conversation_history.get(uid, [])
 
 
-# ── History helpers（Redis 或 in-memory）────────────────────────────────────
-
-def get_history(user_id: str) -> list:
-    if redis_client:
-        try:
-            data = redis_client.get(f"hist:{user_id}")
-            return json.loads(data) if data else []
-        except Exception:
-            pass
-    return conversation_history.get(user_id, [])
+def save_history(uid: str, history: list):
+    if len(history) > HISTORY_LIMIT * 2:
+        history = history[-(HISTORY_LIMIT * 2):]
+    conversation_history[uid] = history
+    _last_active[uid] = time.time()
 
 
-def save_history(user_id: str, history: list):
-    if redis_client:
-        try:
-            redis_client.set(f"hist:{user_id}", json.dumps(history, ensure_ascii=False), ex=HISTORY_TTL)
-            return
-        except Exception:
-            pass
-    conversation_history[user_id] = history
-    conversation_last_active[user_id] = time.time()
+# ── 去重 ──────────────────────────────────────────────────────────────────────
+_seen: dict[str, float] = {}
 
 
-# ── 對話摘要壓縮 ──────────────────────────────────────────────────────────────
-
-def compress_history(history: list) -> list:
-    """歷史超過上限時，將舊訊息摘要為一段背景，保留近期對話"""
-    if len(history) <= HISTORY_LIMIT:
-        return history
-
-    keep = HISTORY_LIMIT // 2
-    old, recent = history[:-keep], history[-keep:]
-
-    convo = "\n".join(
-        f"{'使用者' if m['role'] == 'user' else '助理'}：{str(m['content'])[:200]}"
-        for m in old
-    )
-    try:
-        resp = groq_client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            max_tokens=150,
-            messages=[
-                {"role": "system", "content": "用1-2句話摘要以下對話重點，繁體中文。"},
-                {"role": "user", "content": convo},
-            ],
-        )
-        summary = resp.choices[0].message.content.strip()
-    except Exception:
-        summary = "（舊對話記錄）"
-
-    return [
-        {"role": "user", "content": f"[對話背景摘要] {summary}"},
-        {"role": "assistant", "content": "好的，我了解先前的對話背景。"},
-    ] + recent
-
-
-# ── Dynamic max_tokens ────────────────────────────────────────────────────────
-
-def calc_max_tokens(text: str) -> int:
-    length = len(text)
-    if length < 30:
-        return 512
-    elif length < 100:
-        return 1024
-    return 2048
-
-
-# ── Message deduplication ─────────────────────────────────────────────────────
-
-_processed_ids: dict[str, float] = {}
-_DEDUP_TTL = 60  # 60 秒內重複的 message_id 直接忽略
-
-
-def is_duplicate(message_id: str) -> bool:
+def is_duplicate(mid: str) -> bool:
     now = time.time()
-    expired = [mid for mid, t in _processed_ids.items() if now - t > _DEDUP_TTL]
-    for mid in expired:
-        _processed_ids.pop(mid, None)
-    if message_id in _processed_ids:
+    _seen.update({k: v for k, v in _seen.items() if now - v < 60})
+    if mid in _seen:
         return True
-    _processed_ids[message_id] = now
+    _seen[mid] = now
     return False
 
 
-WEATHER_KEYWORDS = ["天氣", "氣溫", "溫度", "下雨", "幾度", "晴天", "陰天", "weather", "temperature"]
+# ── Rate limit ────────────────────────────────────────────────────────────────
+_rl: dict[str, list] = {}
 
 
-def is_weather_query(text: str) -> bool:
-    return any(kw in text.lower() for kw in WEATHER_KEYWORDS)
+def check_rate_limit(uid: str) -> bool:
+    now = time.time()
+    ts = [t for t in _rl.get(uid, []) if now - t < 60]
+    if len(ts) >= 15:
+        return False
+    ts.append(now)
+    _rl[uid] = ts
+    return True
+
+
+# ── LINE 傳訊 helpers ─────────────────────────────────────────────────────────
+def reply(token: str, text: str):
+    with ApiClient(configuration) as c:
+        MessagingApi(c).reply_message(
+            ReplyMessageRequest(reply_token=token,
+                                messages=[TextMessage(text=text[:5000])]))
+
+
+def push(uid: str, text: str):
+    with ApiClient(configuration) as c:
+        MessagingApi(c).push_message(
+            PushMessageRequest(to=uid,
+                               messages=[TextMessage(text=text[:5000])]))
+
+
+# ── Claude API ────────────────────────────────────────────────────────────────
+def ask_claude(uid: str, user_content, label: str | None = None) -> str:
+    history = get_history(uid)
+    history.append({"role": "user", "content": user_content})
+
+    resp = claude_client.messages.create(
+        model=MODEL,
+        max_tokens=1024,
+        system=SYSTEM_PROMPT,
+        messages=history,
+    )
+    answer = resp.content[0].text
+    history.append({"role": "assistant", "content": answer})
+    save_history(uid, history)
+    return answer
+
+
+# ── 天氣 ──────────────────────────────────────────────────────────────────────
+WEATHER_KW = ["天氣", "氣溫", "溫度", "下雨", "幾度", "晴天", "陰天", "weather", "temperature"]
+CITY_MAP = {
+    "台北": "Taipei", "臺北": "Taipei", "新北": "New Taipei",
+    "台中": "Taichung", "台南": "Tainan", "高雄": "Kaohsiung",
+    "東京": "Tokyo", "大阪": "Osaka", "首爾": "Seoul", "釜山": "Busan",
+    "新加坡": "Singapore", "香港": "Hong Kong",
+}
+
+
+def is_weather(text: str) -> bool:
+    return any(kw in text.lower() for kw in WEATHER_KW)
 
 
 def extract_city(text: str) -> str | None:
-    patterns = [
-        r'(.+?)(?:的)?(?:天氣|氣溫|溫度|幾度|下雨)',
-        r'(?:weather|temperature)\s+(?:in|at|of)\s+(.+)',
-        r'(.+?)\s+(?:weather|temperature)',
-    ]
-    for pattern in patterns:
-        m = re.search(pattern, text, re.IGNORECASE)
+    for pat in [r'(.+?)(?:的)?(?:天氣|氣溫|幾度)', r'(?:weather|temp(?:erature)?)\s+(?:in|at)\s+(.+)']:
+        m = re.search(pat, text, re.I)
         if m:
-            city = m.group(1).strip()
-            city = re.sub(r'^(幫我查|查一下|查|請問|請|告訴我|現在|今天|明天)', '', city).strip()
-            if city:
-                return city
+            city = re.sub(r'^(幫我查|查一下|查|請問|請|告訴我|現在|今天)', '', m.group(1)).strip()
+            return city or None
     return None
-
-
-def normalize_city(city: str) -> str:
-    """將城市名稱翻譯成英文：先查本地對照表，未命中才呼叫 Groq"""
-    if city in CITY_MAP:
-        return CITY_MAP[city]
-    try:
-        resp = groq_client.chat.completions.create(
-            model="llama-3.1-8b-instant",  # 用小模型節省 token
-            max_tokens=20,
-            messages=[
-                {"role": "system", "content": "Translate the city name to English. Reply with ONLY the English city name, nothing else."},
-                {"role": "user", "content": city},
-            ],
-        )
-        return resp.choices[0].message.content.strip()
-    except Exception:
-        return city
 
 
 def get_weather(city: str) -> str:
     if not OPENWEATHER_API_KEY:
-        return "⚠️ 未設定 OPENWEATHER_API_KEY，無法查詢天氣。"
-    city = normalize_city(city)
+        return "⚠️ 未設定 OPENWEATHER_API_KEY"
+    en = CITY_MAP.get(city, city)
     try:
-        resp = requests.get(
-            "https://api.openweathermap.org/data/2.5/weather",
-            params={"q": city, "appid": OPENWEATHER_API_KEY, "units": "metric", "lang": "zh_tw"},
-            timeout=10,
-        )
-        if resp.status_code == 404:
-            return f"找不到城市「{city}」，請確認城市名稱（建議用英文，例如 Taipei、Tokyo）。"
-        resp.raise_for_status()
-        d = resp.json()
-        return (
-            f"城市：{d['name']}\n"
-            f"天氣：{d['weather'][0]['description']}\n"
-            f"氣溫：{d['main']['temp']}°C（體感 {d['main']['feels_like']}°C）\n"
-            f"濕度：{d['main']['humidity']}%\n"
-            f"風速：{d['wind']['speed']} m/s"
-        )
+        r = requests.get("https://api.openweathermap.org/data/2.5/weather",
+                         params={"q": en, "appid": OPENWEATHER_API_KEY,
+                                 "units": "metric", "lang": "zh_tw"}, timeout=10)
+        r.raise_for_status()
+        d = r.json()
+        return (f"📍 {d['name']}\n"
+                f"🌤 {d['weather'][0]['description']}\n"
+                f"🌡 {d['main']['temp']}°C（體感 {d['main']['feels_like']}°C）\n"
+                f"💧 濕度 {d['main']['humidity']}%")
     except Exception as e:
-        return f"查詢天氣失敗：{e}"
+        return f"查詢失敗：{e}"
 
 
-def get_line_file(message_id: str) -> bytes:
-    """從 LINE 下載圖片或檔案內容"""
-    url = f"https://api-data.line.me/v2/bot/message/{message_id}/content"
-    headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
-    resp = requests.get(url, headers=headers, timeout=30)
-    resp.raise_for_status()
-    return resp.content
+# ── 遠端控制（僅限 OWNER）────────────────────────────────────────────────────
+ALLOWED_CMDS = {
+    "dir", "ls", "echo", "python", "pip", "git", "node", "npm",
+    "type", "cat", "ping", "ipconfig", "tasklist", "claude",
+}
 
 
-# Rate limiting：每位使用者每分鐘最多 10 則
-rate_limit_count: dict[str, list] = {}
-RATE_LIMIT = 10
-RATE_WINDOW = 60
+def is_owner(uid: str) -> bool:
+    return uid == OWNER_USER_ID
 
 
-def check_rate_limit(user_id: str) -> bool:
-    """回傳 True 表示未超限，False 表示超限"""
-    now = time.time()
-    timestamps = rate_limit_count.setdefault(user_id, [])
-    rate_limit_count[user_id] = [t for t in timestamps if now - t < RATE_WINDOW]
-    if len(rate_limit_count[user_id]) >= RATE_LIMIT:
-        return False
-    rate_limit_count[user_id].append(now)
-    return True
-
-
-def reply(reply_token: str, text: str):
-    """快速回覆（用於即時指令，不呼叫 AI）"""
-    with ApiClient(configuration) as api_client:
-        line_api = MessagingApi(api_client)
-        line_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=reply_token,
-                messages=[TextMessage(text=text[:5000])],
-            )
+def safe_run(cmd: str) -> str:
+    """執行 shell 指令，回傳輸出（最多 3000 字）"""
+    first_word = cmd.strip().split()[0].lower() if cmd.strip() else ""
+    if first_word not in ALLOWED_CMDS:
+        return f"⛔ 指令 '{first_word}' 不在白名單內\n允許：{', '.join(sorted(ALLOWED_CMDS))}"
+    try:
+        result = subprocess.run(
+            cmd, shell=True, capture_output=True,
+            text=True, timeout=30, encoding="utf-8", errors="replace"
         )
+        out = (result.stdout + result.stderr).strip()
+        return out[:3000] if out else "（無輸出）"
+    except subprocess.TimeoutExpired:
+        return "⚠️ 指令逾時（30 秒）"
+    except Exception as e:
+        return f"⚠️ 執行錯誤：{e}"
 
 
-def push(user_id: str, text: str):
-    """主動推送訊息（AI 回應使用，不受 30 秒 reply token 限制）"""
-    with ApiClient(configuration) as api_client:
-        line_api = MessagingApi(api_client)
-        line_api.push_message(
-            PushMessageRequest(
-                to=user_id,
-                messages=[TextMessage(text=text[:5000])],
-            )
+def run_claude_cli(prompt: str) -> str:
+    """呼叫 claude CLI 執行一次性任務"""
+    try:
+        result = subprocess.run(
+            ["claude", "-p", prompt, "--output-format", "text"],
+            capture_output=True, text=True, timeout=120,
+            encoding="utf-8", errors="replace"
         )
+        out = (result.stdout + result.stderr).strip()
+        return out[:4000] if out else "（無輸出）"
+    except FileNotFoundError:
+        return "⚠️ 找不到 claude CLI，請確認是否已安裝 Claude Code"
+    except subprocess.TimeoutExpired:
+        return "⚠️ Claude CLI 逾時（120 秒）"
+    except Exception as e:
+        return f"⚠️ 錯誤：{e}"
 
 
-def ask_groq(user_id: str, messages: list, model: str = TEXT_MODEL, history_label: str | None = None) -> str:
-    """
-    呼叫 Groq API，維持對話歷史。
-    history_label: 存入歷史的簡化描述（None 則存 messages[0] 的完整 content）
-    """
-    history = get_history(user_id)
-    if not redis_client:
-        conversation_last_active[user_id] = time.time()
-        cleanup_expired()
-
-    if model == VISION_MODEL:
-        api_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + messages
-        response = groq_client.chat.completions.create(
-            model=model, max_tokens=2048, messages=api_messages,
-        )
-        assistant_text = response.choices[0].message.content
-        history.append({"role": "user", "content": history_label or "[傳送了一張圖片]"})
-        history.append({"role": "assistant", "content": assistant_text})
-        save_history(user_id, history)
-        return assistant_text
-
-    # 存簡化標籤到歷史，避免天氣資料/檔案內文永久佔用 token
-    stored = history_label if history_label else messages[0]["content"]
-    history.append({"role": "user", "content": stored})
-    history = compress_history(history)  # 超過上限時自動摘要壓縮
-
-    # 歷史（除最後一筆）過濾 list content，最後一筆用原始 messages
-    filtered = []
-    for m in history[:-1]:
-        content = m.get("content")
-        if isinstance(content, list):
-            text = " ".join(
-                p.get("text", "") for p in content
-                if isinstance(p, dict) and p.get("type") == "text"
-            ) or "[圖片]"
-            filtered.append({"role": m["role"], "content": text})
-        else:
-            filtered.append(m)
-
-    api_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + filtered + messages
-
-    # 動態 max_tokens：根據訊息長度決定，避免短問題浪費配額
-    user_text = messages[0].get("content", "") if isinstance(messages[0].get("content"), str) else ""
-    max_tokens = calc_max_tokens(user_text)
-
-    response = groq_client.chat.completions.create(
-        model=model, max_tokens=max_tokens, messages=api_messages,
-    )
-    assistant_text = response.choices[0].message.content
-    history.append({"role": "assistant", "content": assistant_text})
-    save_history(user_id, history)
-    return assistant_text
-
-
+# ── Webhook 路由 ──────────────────────────────────────────────────────────────
 @app.route("/health")
 def health():
     return "OK"
@@ -351,136 +219,160 @@ def health():
 
 @app.route("/callback", methods=["POST"])
 def callback():
-    signature = request.headers.get("X-Line-Signature", "")
+    sig  = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
     try:
-        handler.handle(body, signature)
+        handler.handle(body, sig)
     except InvalidSignatureError:
         abort(400)
     return "OK"
 
 
+# ── 文字訊息處理 ──────────────────────────────────────────────────────────────
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_text(event: MessageEvent):
     if is_duplicate(event.message.id):
         return
-    user_id = event.source.user_id
+    uid  = event.source.user_id
     text = event.message.text.strip()
 
-    if not check_rate_limit(user_id):
-        reply(event.reply_token, "⚠️ 你傳送太快了，請稍等一下再試。")
+    if not check_rate_limit(uid):
+        reply(event.reply_token, "⚠️ 傳送太快，請稍等再試。")
         return
 
+    # ── 快速指令 ──────────────────────────────────────────────────────────────
     if text == "/myid":
-        reply(event.reply_token, f"你的 LINE User ID：\n{user_id}")
+        reply(event.reply_token, f"你的 LINE User ID：\n{uid}")
         return
 
     if text in ("/reset", "重置", "清除對話"):
-        if redis_client:
-            try:
-                redis_client.delete(f"hist:{user_id}")
-            except Exception:
-                pass
-        conversation_history.pop(user_id, None)
-        reply(event.reply_token, "對話已重置。")
+        conversation_history.pop(uid, None)
+        reply(event.reply_token, "✅ 對話已重置。")
         return
 
     if text == "/status":
-        if redis_client:
-            try:
-                redis_client.ping()
-                status = "✅ Redis 已連線（對話歷史持久化中）"
-            except Exception as e:
-                status = f"⚠️ Redis 連線失敗：{e}"
-        else:
-            status = "📦 使用 in-memory 模式（重啟後歷史清空）"
-        reply(event.reply_token, status)
+        hist_len = len(conversation_history.get(uid, []))
+        reply(event.reply_token,
+              f"🤖 Claude AI助理 運作中\n"
+              f"模型：{MODEL}\n"
+              f"對話歷史：{hist_len} 則\n"
+              f"遠端控制：{'✅ 已啟用' if is_owner(uid) else '❌ 僅限擁有者'}")
         return
 
-    def process():
+    # ── 遠端控制指令（僅限 OWNER）─────────────────────────────────────────────
+    if text.startswith("!run "):
+        if not is_owner(uid):
+            reply(event.reply_token, "⛔ 無權限執行指令")
+            return
+        cmd = text[5:].strip()
+        reply(event.reply_token, f"⚙️ 執行中：{cmd}")
+        def _run():
+            out = safe_run(cmd)
+            push(uid, f"```\n{out}\n```")
+        threading.Thread(target=_run, daemon=True).start()
+        return
+
+    if text.startswith("!claude "):
+        if not is_owner(uid):
+            reply(event.reply_token, "⛔ 無權限執行指令")
+            return
+        prompt = text[8:].strip()
+        reply(event.reply_token, f"🤖 Claude Code 處理中...")
+        def _cc():
+            out = run_claude_cli(prompt)
+            push(uid, out)
+        threading.Thread(target=_cc, daemon=True).start()
+        return
+
+    if text.startswith("!push "):
+        # 主動推送訊息給自己（測試用）
+        if not is_owner(uid):
+            reply(event.reply_token, "⛔ 無權限")
+            return
+        msg = text[6:].strip()
+        push(OWNER_USER_ID, msg)
+        return
+
+    # ── 天氣查詢 ──────────────────────────────────────────────────────────────
+    if is_weather(text):
+        city = extract_city(text)
+        if city:
+            reply(event.reply_token, "🔍 查詢中...")
+            def _weather():
+                info = get_weather(city)
+                content = f"{text}\n\n[即時天氣]\n{info}"
+                ans = ask_claude(uid, [{"type": "text", "text": content}],
+                                 label=f"[查了{city}天氣]")
+                push(uid, f"{info}\n\n{ans}")
+            threading.Thread(target=_weather, daemon=True).start()
+            return
+
+    # ── 一般 AI 對話 ──────────────────────────────────────────────────────────
+    def _chat():
         try:
-            content = text
-            label = None
-            if is_weather_query(text):
-                city = extract_city(text)
-                if not city:
-                    push(user_id, "請告訴我你想查哪個城市的天氣？")
-                    return
-                weather_info = get_weather(city)
-                content = f"{text}\n\n[即時天氣資料]\n{weather_info}"
-                label = f"[查詢了 {city} 的天氣]"
-            messages = [{"role": "user", "content": content}]
-            answer = ask_groq(user_id, messages, history_label=label)
-            push(user_id, answer)
+            ans = ask_claude(uid, [{"type": "text", "text": text}])
+            push(uid, ans)
         except Exception as e:
-            push(user_id, f"⚠️ 發生錯誤：{e}")
+            push(uid, f"⚠️ 錯誤：{e}")
+    threading.Thread(target=_chat, daemon=True).start()
 
-    threading.Thread(target=process, daemon=True).start()
 
-
+# ── 圖片處理 ──────────────────────────────────────────────────────────────────
 @handler.add(MessageEvent, message=ImageMessageContent)
 def handle_image(event: MessageEvent):
     if is_duplicate(event.message.id):
         return
-    user_id = event.source.user_id
-    image_bytes = get_line_file(event.message.id)
-    b64 = base64.standard_b64encode(image_bytes).decode()
+    uid = event.source.user_id
+    url = f"https://api-data.line.me/v2/bot/message/{event.message.id}/content"
+    headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
+    img_bytes = requests.get(url, headers=headers, timeout=30).content
+    b64 = base64.standard_b64encode(img_bytes).decode()
 
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
-                },
-                {"type": "text", "text": "請分析這張圖片，用繁體中文說明內容。"},
-            ],
-        }
-    ]
-    def process():
+    def _img():
         try:
-            answer = ask_groq(user_id, messages, model=VISION_MODEL)
-            push(user_id, answer)
+            ans = ask_claude(uid, [
+                {"type": "image", "source": {"type": "base64",
+                                              "media_type": "image/jpeg",
+                                              "data": b64}},
+                {"type": "text", "text": "請分析這張圖片，用繁體中文說明內容。"},
+            ], label="[傳了一張圖片]")
+            push(uid, ans)
         except Exception as e:
-            push(user_id, f"⚠️ 發生錯誤：{e}")
+            push(uid, f"⚠️ 圖片分析失敗：{e}")
+    threading.Thread(target=_img, daemon=True).start()
 
-    threading.Thread(target=process, daemon=True).start()
 
-
+# ── 檔案處理 ──────────────────────────────────────────────────────────────────
 @handler.add(MessageEvent, message=FileMessageContent)
 def handle_file(event: MessageEvent):
     if is_duplicate(event.message.id):
         return
-    user_id = event.source.user_id
-    file_name = event.message.file_name or "file"
-    file_bytes = get_line_file(event.message.id)
+    uid  = event.source.user_id
+    name = event.message.file_name or "file"
+    url  = f"https://api-data.line.me/v2/bot/message/{event.message.id}/content"
+    headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
+    raw = requests.get(url, headers=headers, timeout=30).content
+    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
 
-    ext = file_name.rsplit(".", 1)[-1].lower() if "." in file_name else ""
+    TEXT_EXT = {"txt", "csv", "md", "json", "xml", "py", "js", "ts", "html", "css", "log"}
+    if ext not in TEXT_EXT:
+        reply(event.reply_token, f"不支援 .{ext}，支援：{', '.join(sorted(TEXT_EXT))}")
+        return
 
-    if ext in ("txt", "csv", "md", "json", "xml", "py", "js", "ts", "html", "css"):
+    content = raw.decode("utf-8", errors="replace")
+
+    def _file():
         try:
-            text_content = file_bytes.decode("utf-8", errors="replace")
-        except Exception:
-            text_content = file_bytes.decode("big5", errors="replace")
-        messages = [
-            {
-                "role": "user",
-                "content": f"以下是檔案 `{file_name}` 的內容：\n\n{text_content}\n\n請用繁體中文分析並摘要重點。",
-            }
-        ]
-        def process():
-            try:
-                answer = ask_groq(user_id, messages, history_label=f"[分析了檔案 {file_name}]")
-                push(user_id, answer)
-            except Exception as e:
-                push(user_id, f"⚠️ 發生錯誤：{e}")
-
-        threading.Thread(target=process, daemon=True).start()
-    else:
-        reply(event.reply_token, f"目前不支援 .{ext} 格式，支援：圖片、txt、csv、md、json 等文字類型檔案。")
+            ans = ask_claude(uid,
+                             [{"type": "text",
+                               "text": f"檔案 `{name}` 內容：\n\n{content[:8000]}\n\n請用繁體中文摘要重點。"}],
+                             label=f"[分析了{name}]")
+            push(uid, ans)
+        except Exception as e:
+            push(uid, f"⚠️ 檔案分析失敗：{e}")
+    threading.Thread(target=_file, daemon=True).start()
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, debug=False)
