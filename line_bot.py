@@ -17,79 +17,48 @@ from linebot.v3.webhooks import (
     MessageEvent, TextMessageContent,
     ImageMessageContent, FileMessageContent,
 )
-import anthropic
+from groq import Groq
 
 app = Flask(__name__)
 
 # ── 環境變數 ──────────────────────────────────────────────────────────────────
 LINE_CHANNEL_ACCESS_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
 LINE_CHANNEL_SECRET       = os.environ["LINE_CHANNEL_SECRET"]
-ANTHROPIC_API_KEY         = os.environ["ANTHROPIC_API_KEY"]
+GROQ_API_KEY              = os.environ["GROQ_API_KEY"]
 OWNER_USER_ID             = os.environ.get("LINE_USER_ID", "")
 OPENWEATHER_API_KEY       = os.environ.get("OPENWEATHER_API_KEY", "")
 
-MODEL_HAIKU  = "claude-haiku-4-5-20251001"
-MODEL_SONNET = "claude-sonnet-4-6"
+# Groq 模型
+MODEL_TEXT   = "llama-3.3-70b-versatile"   # 一般對話
+MODEL_FAST   = "llama-3.1-8b-instant"      # 快速簡單回覆
+MODEL_VISION = "meta-llama/llama-4-scout-17b-16e-instruct"  # 圖片辨識
 
-# ── 預算設定（NT$150 / 31.3 ≈ $4.79 USD）────────────────────────────────────
-BUDGET_USD = 4.79
-MODEL_PRICING = {
-    MODEL_HAIKU:  {"input": 1.0 / 1_000_000, "output": 5.0 / 1_000_000},
-    MODEL_SONNET: {"input": 3.0 / 1_000_000, "output": 15.0 / 1_000_000},
-}
-_monthly_cost: dict[str, float] = {}
-
-# 需要 Sonnet 的關鍵詞（複雜任務）
-_COMPLEX_KW = [
-    "程式", "code", "script", "debug", "bug", "function",
-    "幫我寫", "幫我做", "幫我設計", "幫我規劃",
-    "分析", "詳細", "解釋", "比較", "教我", "步驟", "流程",
-    "架構", "設計", "規劃",
-]
-
-
-def select_model(text: str = "", has_image: bool = False, has_file: bool = False) -> str:
-    """Haiku 為主，圖片/檔案/複雜問題升級 Sonnet"""
-    if has_image or has_file:
-        return MODEL_SONNET
-    if len(text) > 200:
-        return MODEL_SONNET
-    if any(kw in text for kw in _COMPLEX_KW):
-        return MODEL_SONNET
-    return MODEL_HAIKU
-
-
-def _month_key() -> str:
-    return time.strftime("%Y-%m")
-
-
-def _add_cost(model: str, input_tokens: int, output_tokens: int):
-    p = MODEL_PRICING.get(model, MODEL_PRICING[MODEL_HAIKU])
-    cost = p["input"] * input_tokens + p["output"] * output_tokens
-    key = _month_key()
-    _monthly_cost[key] = _monthly_cost.get(key, 0.0) + cost
-
-
-def get_monthly_cost_usd() -> float:
-    return _monthly_cost.get(_month_key(), 0.0)
-
-
-def is_over_budget() -> bool:
-    return get_monthly_cost_usd() >= BUDGET_USD
-
-
-configuration  = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
-handler        = WebhookHandler(LINE_CHANNEL_SECRET)
-claude_client  = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
+handler       = WebhookHandler(LINE_CHANNEL_SECRET)
+groq_client   = Groq(api_key=GROQ_API_KEY)
 
 SYSTEM_PROMPT = (
-    "你的名字是「Claude AI助理」，你是 Yitzo 的私人 AI 助理，由 Anthropic Claude 驅動。\n"
+    "你的名字是「AI助理」，你是 Yitzo 的私人 AI 助理。\n"
     "規則：\n"
     "1. 永遠用繁體中文回覆，除非對方用其他語言提問\n"
     "2. 回覆控制在 500 字以內，除非使用者要求詳細\n"
     "3. 回答簡潔扼要，必要時條列說明\n"
     "4. 不透露底層技術細節"
 )
+
+# A1 施工紀錄 prompt
+CONSTRUCTION_PHOTO_PROMPT = (
+    "你是台灣建築工地施工紀錄助理。"
+    "請分析這張工地照片，用繁體中文輸出一行施工紀錄，格式固定：[部位] [工項] [狀態]，"
+    "例如：B2層 鋼筋綁紮 完成。只輸出這一行，不超過15字，不需要其他說明。"
+)
+
+
+def select_model(text: str = "") -> str:
+    """簡單問題用快速模型，其他用標準模型"""
+    if len(text) < 30:
+        return MODEL_FAST
+    return MODEL_TEXT
 
 # ── 對話歷史（in-memory）────────────────────────────────────────────────────
 conversation_history: dict[str, list] = {}
@@ -154,27 +123,32 @@ def push(uid: str, text: str):
                                messages=[TextMessage(text=text[:5000])]))
 
 
-# ── Claude API ────────────────────────────────────────────────────────────────
-def ask_claude(uid: str, user_content, label: str | None = None,
-               model: str | None = None) -> str:
-    if is_over_budget():
-        cost_twd = get_monthly_cost_usd() * 31.3
-        return f"⚠️ 本月 AI 費用已達上限（NT${cost_twd:.0f}），下個月再繼續使用。"
-
-    chosen = model or MODEL_HAIKU
+# ── Groq API ──────────────────────────────────────────────────────────────────
+def ask_groq(uid: str, user_content, model: str | None = None) -> str:
+    chosen = model or MODEL_TEXT
     history = get_history(uid)
-    history.append({"role": "user", "content": user_content})
 
-    resp = claude_client.messages.create(
-        model=chosen,
-        max_tokens=1024,
-        system=SYSTEM_PROMPT,
-        messages=history,
+    # 圖片訊息不存入歷史（Groq 不支援多輪圖片）
+    is_multimodal = isinstance(user_content, list) and any(
+        m.get("type") == "image_url" for m in user_content
     )
-    answer = resp.content[0].text
-    _add_cost(chosen, resp.usage.input_tokens, resp.usage.output_tokens)
-    history.append({"role": "assistant", "content": answer})
-    save_history(uid, history)
+
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    if not is_multimodal:
+        messages += history
+    messages.append({"role": "user", "content": user_content})
+
+    resp = groq_client.chat.completions.create(
+        model=chosen,
+        messages=messages,
+        max_tokens=1024,
+    )
+    answer = resp.choices[0].message.content
+
+    if not is_multimodal:
+        history.append({"role": "user", "content": user_content})
+        history.append({"role": "assistant", "content": answer})
+        save_history(uid, history)
     return answer
 
 
@@ -307,14 +281,10 @@ def handle_text(event: MessageEvent):
 
     if text == "/status":
         hist_len = len(conversation_history.get(uid, []))
-        cost_usd = get_monthly_cost_usd()
-        cost_twd = cost_usd * 31.3
-        budget_twd = BUDGET_USD * 31.3
         reply(event.reply_token,
-              f"🤖 Claude AI助理 運作中\n"
-              f"模型：Haiku（主）/ Sonnet（備）\n"
-              f"對話歷史：{hist_len} 則\n"
-              f"本月費用：NT${cost_twd:.1f} / NT${budget_twd:.0f}\n"
+              f"🤖 AI助理 運作中\n"
+              f"引擎：Groq（免費）\n"
+              f"對話歷史：{hist_len // 2} 則\n"
               f"遠端控制：{'✅ 已啟用' if is_owner(uid) else '❌ 僅限擁有者'}")
         return
 
@@ -360,8 +330,7 @@ def handle_text(event: MessageEvent):
             def _weather():
                 info = get_weather(city)
                 content = f"{text}\n\n[即時天氣]\n{info}"
-                ans = ask_claude(uid, [{"type": "text", "text": content}],
-                                 label=f"[查了{city}天氣]", model=MODEL_HAIKU)
+                ans = ask_groq(uid, content, model=MODEL_FAST)
                 push(uid, f"{info}\n\n{ans}")
             threading.Thread(target=_weather, daemon=True).start()
             return
@@ -371,14 +340,14 @@ def handle_text(event: MessageEvent):
 
     def _chat():
         try:
-            ans = ask_claude(uid, [{"type": "text", "text": text}], model=chosen)
+            ans = ask_groq(uid, text, model=chosen)
             push(uid, ans)
         except Exception as e:
             push(uid, f"⚠️ 錯誤：{e}")
     threading.Thread(target=_chat, daemon=True).start()
 
 
-# ── 圖片處理 ──────────────────────────────────────────────────────────────────
+# ── 圖片處理（A1 施工紀錄）──────────────────────────────────────────────────
 @handler.add(MessageEvent, message=ImageMessageContent)
 def handle_image(event: MessageEvent):
     if is_duplicate(event.message.id):
@@ -394,13 +363,13 @@ def handle_image(event: MessageEvent):
 
     def _img():
         try:
-            ans = ask_claude(uid, [
-                {"type": "image", "source": {"type": "base64",
-                                              "media_type": "image/jpeg",
-                                              "data": b64}},
-                {"type": "text", "text": "請分析這張圖片，用繁體中文說明內容。"},
-            ], label="[傳了一張圖片]", model=select_model(has_image=True))
-            push(uid, ans)
+            content = [
+                {"type": "image_url",
+                 "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                {"type": "text", "text": CONSTRUCTION_PHOTO_PROMPT},
+            ]
+            ans = ask_groq(uid, content, model=MODEL_VISION)
+            push(uid, f"📋 {ans}")
         except Exception as e:
             push(uid, f"⚠️ 圖片分析失敗：{e}")
     threading.Thread(target=_img, daemon=True).start()
@@ -430,11 +399,9 @@ def handle_file(event: MessageEvent):
 
     def _file():
         try:
-            ans = ask_claude(uid,
-                             [{"type": "text",
-                               "text": f"檔案 `{name}` 內容：\n\n{content[:8000]}\n\n請用繁體中文摘要重點。"}],
-                             label=f"[分析了{name}]",
-                             model=select_model(has_file=True))
+            ans = ask_groq(uid,
+                           f"檔案 `{name}` 內容：\n\n{content[:8000]}\n\n請用繁體中文摘要重點。",
+                           model=MODEL_TEXT)
             push(uid, ans)
         except Exception as e:
             push(uid, f"⚠️ 檔案分析失敗：{e}")
