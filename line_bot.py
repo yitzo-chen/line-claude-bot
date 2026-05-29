@@ -18,6 +18,7 @@ from linebot.v3.webhooks import (
     ImageMessageContent, FileMessageContent,
 )
 from groq import Groq
+import rebar_query
 
 app = Flask(__name__)
 
@@ -124,7 +125,8 @@ def push(uid: str, text: str):
 
 
 # ── Groq API ──────────────────────────────────────────────────────────────────
-def ask_groq(uid: str, user_content, model: str | None = None) -> str:
+def ask_groq(uid: str, user_content, model: str | None = None,
+             system: str | None = None) -> str:
     chosen = model or MODEL_TEXT
     history = get_history(uid)
 
@@ -133,7 +135,7 @@ def ask_groq(uid: str, user_content, model: str | None = None) -> str:
         m.get("type") == "image_url" for m in user_content
     )
 
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages = [{"role": "system", "content": system or SYSTEM_PROMPT}]
     if not is_multimodal:
         messages += history
     messages.append({"role": "user", "content": user_content})
@@ -334,6 +336,19 @@ def handle_text(event: MessageEvent):
                 push(uid, f"{info}\n\n{ans}")
             threading.Thread(target=_weather, daemon=True).start()
             return
+
+    # ── B1 鋼筋混凝土規範查詢 ─────────────────────────────────────────────────
+    if rebar_query.is_reg_query(text):
+        def _reg():
+            try:
+                msg = rebar_query.build_query_message(text)
+                ans = ask_groq(uid, msg, model=MODEL_TEXT,
+                               system=rebar_query.REG_SYSTEM)
+                push(uid, ans + rebar_query.VERSION_NOTE)
+            except Exception as e:
+                push(uid, f"⚠️ 規範查詢錯誤：{e}")
+        threading.Thread(target=_reg, daemon=True).start()
+        return
 
     # ── 一般 AI 對話 ──────────────────────────────────────────────────────────
     chosen = select_model(text)
