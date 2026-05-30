@@ -162,7 +162,7 @@ def ask_groq(uid: str, user_content, model: str | None = None,
 
 
 # ── 天氣 ──────────────────────────────────────────────────────────────────────
-WEATHER_KW = ["天氣", "氣溫", "溫度", "下雨", "幾度", "晴天", "陰天", "weather", "temperature"]
+WEATHER_KW = ["天氣", "氣溫", "溫度", "下雨", "幾度", "晴天", "陰天", "降雨", "下雪", "颱風", "weather", "temperature"]
 
 
 def is_weather(text: str) -> bool:
