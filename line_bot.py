@@ -1,6 +1,4 @@
 import os
-import re
-import json
 import time
 import base64
 import threading
@@ -31,16 +29,21 @@ OWNER_USER_ID             = os.environ.get("LINE_USER_ID", "")
 OPENWEATHER_API_KEY       = os.environ.get("OPENWEATHER_API_KEY", "")
 
 # Groq 模型
-MODEL_TEXT   = "llama-3.3-70b-versatile"   # 一般對話
-MODEL_FAST   = "llama-3.1-8b-instant"      # 快速簡單回覆
-MODEL_VISION = "meta-llama/llama-4-scout-17b-16e-instruct"  # 圖片辨識
+MODEL_TEXT   = "llama-3.3-70b-versatile"
+MODEL_FAST   = "llama-3.1-8b-instant"
+MODEL_VISION = "meta-llama/llama-4-scout-17b-16e-instruct"
 
 configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler       = WebhookHandler(LINE_CHANNEL_SECRET)
 groq_client   = Groq(api_key=GROQ_API_KEY)
 
+_WEEKDAY_ZH = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
+
+
 def get_system_prompt() -> str:
-    today = datetime.now().strftime("%Y年%m月%d日（%A）")
+    now = datetime.now()
+    weekday = _WEEKDAY_ZH[now.weekday()]
+    today = now.strftime(f"%Y年%m月%d日（{weekday}）")
     return (
         f"你的名字是「AI助理」，你是 Yitzo 的私人 AI 助理。\n"
         f"今天日期：{today}\n"
@@ -52,7 +55,6 @@ def get_system_prompt() -> str:
         "5. 被問到日期時間，以系統提供的今天日期為準，不要自行猜測"
     )
 
-SYSTEM_PROMPT = get_system_prompt  # 保留相容性，呼叫時用 get_system_prompt()
 
 # A1 施工紀錄 prompt
 CONSTRUCTION_PHOTO_PROMPT = (
@@ -63,10 +65,10 @@ CONSTRUCTION_PHOTO_PROMPT = (
 
 
 def select_model(text: str = "") -> str:
-    """簡單問題用快速模型，其他用標準模型"""
     if len(text) < 30:
         return MODEL_FAST
     return MODEL_TEXT
+
 
 # ── 對話歷史（in-memory）────────────────────────────────────────────────────
 conversation_history: dict[str, list] = {}
@@ -162,11 +164,14 @@ def ask_groq(uid: str, user_content, model: str | None = None,
 
 
 # ── 天氣 ──────────────────────────────────────────────────────────────────────
-WEATHER_KW = ["天氣", "氣溫", "溫度", "下雨", "幾度", "晴天", "陰天", "降雨", "下雪", "颱風", "weather", "temperature"]
+WEATHER_KW = ["天氣", "氣溫", "溫度", "下雨", "幾度", "晴天", "陰天",
+              "降雨", "下雪", "颱風", "weather", "temperature"]
+
+_STRIP_PUNCT = str.maketrans("", "", "。，、？！,.?!")
 
 
 def is_weather(text: str) -> bool:
-    return any(kw in text.lower() for kw in WEATHER_KW)
+    return any(kw in text for kw in WEATHER_KW)
 
 
 def extract_location_ai(text: str) -> str | None:
@@ -179,13 +184,13 @@ def extract_location_ai(text: str) -> str | None:
                 "content": (
                     "從以下句子抽取地點名稱（城市、區、鄉鎮皆可），"
                     "只輸出地點本身（例：小港區、台北、東京），"
-                    "無法判斷則輸出「無」：\n" + text
+                    "完全無法判斷才輸出「NULL」：\n" + text
                 ),
             }],
             max_tokens=20,
         )
-        loc = resp.choices[0].message.content.strip()
-        return None if "無" in loc else loc
+        loc = resp.choices[0].message.content.strip().translate(_STRIP_PUNCT)
+        return None if loc == "NULL" or not loc else loc
     except Exception:
         return None
 
@@ -197,7 +202,7 @@ def geocode_location(location: str) -> tuple[float, float, str] | None:
     for query in [f"{location},TW", location]:
         try:
             r = requests.get(
-                "http://api.openweathermap.org/geo/1.0/direct",
+                "https://api.openweathermap.org/geo/1.0/direct",
                 params={"q": query, "limit": 1, "appid": OPENWEATHER_API_KEY},
                 timeout=10,
             )
@@ -226,7 +231,6 @@ def get_weather(location: str) -> str:
         r.raise_for_status()
         d = r.json()
 
-        # 從預報取最近一筆降雨機率
         pop_str = ""
         try:
             rf = requests.get("https://api.openweathermap.org/data/2.5/forecast",
@@ -257,7 +261,6 @@ def is_owner(uid: str) -> bool:
 
 
 def safe_run(cmd: str) -> str:
-    """執行 shell 指令，回傳輸出（最多 3000 字）"""
     first_word = cmd.strip().split()[0].lower() if cmd.strip() else ""
     if first_word not in ALLOWED_CMDS:
         return f"⛔ 指令 '{first_word}' 不在白名單內\n允許：{', '.join(sorted(ALLOWED_CMDS))}"
@@ -275,7 +278,6 @@ def safe_run(cmd: str) -> str:
 
 
 def run_claude_cli(prompt: str) -> str:
-    """呼叫 claude CLI 執行一次性任務"""
     try:
         result = subprocess.run(
             ["claude", "-p", prompt, "--output-format", "text"],
@@ -295,7 +297,7 @@ def run_claude_cli(prompt: str) -> str:
 # ── Webhook 路由 ──────────────────────────────────────────────────────────────
 @app.route("/health")
 def health():
-    return "OK v2-geocoding"
+    return "OK"
 
 
 @app.route("/callback", methods=["POST"])
@@ -358,7 +360,7 @@ def handle_text(event: MessageEvent):
             reply(event.reply_token, "⛔ 無權限執行指令")
             return
         prompt = text[8:].strip()
-        reply(event.reply_token, f"🤖 Claude Code 處理中...")
+        reply(event.reply_token, "🤖 Claude Code 處理中...")
         def _cc():
             out = run_claude_cli(prompt)
             push(uid, out)
@@ -366,12 +368,10 @@ def handle_text(event: MessageEvent):
         return
 
     if text.startswith("!push "):
-        # 主動推送訊息給自己（測試用）
         if not is_owner(uid):
             reply(event.reply_token, "⛔ 無權限")
             return
-        msg = text[6:].strip()
-        push(OWNER_USER_ID, msg)
+        push(OWNER_USER_ID, text[6:].strip())
         return
 
     # ── 天氣查詢 ──────────────────────────────────────────────────────────────
@@ -400,11 +400,9 @@ def handle_text(event: MessageEvent):
         return
 
     # ── 一般 AI 對話 ──────────────────────────────────────────────────────────
-    chosen = select_model(text)
-
     def _chat():
         try:
-            ans = ask_groq(uid, text, model=chosen)
+            ans = ask_groq(uid, text, model=select_model(text))
             push(uid, ans)
         except Exception as e:
             push(uid, f"⚠️ 錯誤：{e}")
@@ -420,13 +418,16 @@ def handle_image(event: MessageEvent):
     if not check_rate_limit(uid):
         reply(event.reply_token, "⚠️ 傳送太快，請稍等再試。")
         return
-    url = f"https://api-data.line.me/v2/bot/message/{event.message.id}/content"
-    headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
-    img_bytes = requests.get(url, headers=headers, timeout=30).content
-    b64 = base64.standard_b64encode(img_bytes).decode()
+    msg_id = event.message.id
+    reply(event.reply_token, "🔍 分析中...")
 
     def _img():
         try:
+            url = f"https://api-data.line.me/v2/bot/message/{msg_id}/content"
+            headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
+            img_resp = requests.get(url, headers=headers, timeout=30)
+            img_resp.raise_for_status()
+            b64 = base64.standard_b64encode(img_resp.content).decode()
             content = [
                 {"type": "image_url",
                  "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
@@ -448,21 +449,24 @@ def handle_file(event: MessageEvent):
     if not check_rate_limit(uid):
         reply(event.reply_token, "⚠️ 傳送太快，請稍等再試。")
         return
-    name = event.message.file_name or "file"
-    url  = f"https://api-data.line.me/v2/bot/message/{event.message.id}/content"
-    headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
-    raw = requests.get(url, headers=headers, timeout=30).content
-    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    name   = event.message.file_name or "file"
+    msg_id = event.message.id
+    ext    = name.rsplit(".", 1)[-1].lower() if "." in name else ""
 
     TEXT_EXT = {"txt", "csv", "md", "json", "xml", "py", "js", "ts", "html", "css", "log"}
     if ext not in TEXT_EXT:
         reply(event.reply_token, f"不支援 .{ext}，支援：{', '.join(sorted(TEXT_EXT))}")
         return
 
-    content = raw.decode("utf-8", errors="replace")
+    reply(event.reply_token, "📄 分析中...")
 
     def _file():
         try:
+            url = f"https://api-data.line.me/v2/bot/message/{msg_id}/content"
+            headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
+            raw_resp = requests.get(url, headers=headers, timeout=30)
+            raw_resp.raise_for_status()
+            content = raw_resp.content.decode("utf-8", errors="replace")
             ans = ask_groq(uid,
                            f"檔案 `{name}` 內容：\n\n{content[:8000]}\n\n請用繁體中文摘要重點。",
                            model=MODEL_TEXT)
