@@ -156,38 +156,71 @@ def ask_groq(uid: str, user_content, model: str | None = None,
 
 # ── 天氣 ──────────────────────────────────────────────────────────────────────
 WEATHER_KW = ["天氣", "氣溫", "溫度", "下雨", "幾度", "晴天", "陰天", "weather", "temperature"]
-CITY_MAP = {
-    "台北": "Taipei", "臺北": "Taipei", "新北": "New Taipei",
-    "台中": "Taichung", "台南": "Tainan", "高雄": "Kaohsiung",
-    "東京": "Tokyo", "大阪": "Osaka", "首爾": "Seoul", "釜山": "Busan",
-    "新加坡": "Singapore", "香港": "Hong Kong",
-}
 
 
 def is_weather(text: str) -> bool:
     return any(kw in text.lower() for kw in WEATHER_KW)
 
 
-def extract_city(text: str) -> str | None:
-    for pat in [r'(.+?)(?:的)?(?:天氣|氣溫|幾度)', r'(?:weather|temp(?:erature)?)\s+(?:in|at)\s+(.+)']:
-        m = re.search(pat, text, re.I)
-        if m:
-            city = re.sub(r'^(幫我查|查一下|查|請問|請|告訴我|現在|今天)', '', m.group(1)).strip()
-            return city or None
+def extract_location_ai(text: str) -> str | None:
+    """用 Groq 從口語句子中抽取地點名稱"""
+    try:
+        resp = groq_client.chat.completions.create(
+            model=MODEL_FAST,
+            messages=[{
+                "role": "user",
+                "content": (
+                    "從以下句子抽取地點名稱（城市、區、鄉鎮皆可），"
+                    "只輸出地點本身（例：小港區、台北、東京），"
+                    "無法判斷則輸出「無」：\n" + text
+                ),
+            }],
+            max_tokens=20,
+        )
+        loc = resp.choices[0].message.content.strip()
+        return None if "無" in loc else loc
+    except Exception:
+        return None
+
+
+def geocode_location(location: str) -> tuple[float, float, str] | None:
+    """用 OWM Geocoding API 將地名轉座標，優先加 TW 後綴"""
+    if not OPENWEATHER_API_KEY:
+        return None
+    for query in [f"{location},TW", location]:
+        try:
+            r = requests.get(
+                "http://api.openweathermap.org/geo/1.0/direct",
+                params={"q": query, "limit": 1, "appid": OPENWEATHER_API_KEY},
+                timeout=10,
+            )
+            data = r.json()
+            if data:
+                d = data[0]
+                display = d.get("local_names", {}).get("zh", d["name"])
+                return d["lat"], d["lon"], display
+        except Exception:
+            continue
     return None
 
 
-def get_weather(city: str) -> str:
+def get_weather(location: str) -> str:
     if not OPENWEATHER_API_KEY:
         return "⚠️ 未設定 OPENWEATHER_API_KEY"
-    en = CITY_MAP.get(city, city)
+    geo = geocode_location(location)
+    if not geo:
+        return f"⚠️ 找不到「{location}」的地點資料"
+    lat, lon, display_name = geo
     try:
-        r = requests.get("https://api.openweathermap.org/data/2.5/weather",
-                         params={"q": en, "appid": OPENWEATHER_API_KEY,
-                                 "units": "metric", "lang": "zh_tw"}, timeout=10)
+        r = requests.get(
+            "https://api.openweathermap.org/data/2.5/weather",
+            params={"lat": lat, "lon": lon, "appid": OPENWEATHER_API_KEY,
+                    "units": "metric", "lang": "zh_tw"},
+            timeout=10,
+        )
         r.raise_for_status()
         d = r.json()
-        return (f"📍 {d['name']}\n"
+        return (f"📍 {display_name}\n"
                 f"🌤 {d['weather'][0]['description']}\n"
                 f"🌡 {d['main']['temp']}°C（體感 {d['main']['feels_like']}°C）\n"
                 f"💧 濕度 {d['main']['humidity']}%")
@@ -326,16 +359,18 @@ def handle_text(event: MessageEvent):
 
     # ── 天氣查詢 ──────────────────────────────────────────────────────────────
     if is_weather(text):
-        city = extract_city(text)
-        if city:
-            reply(event.reply_token, "🔍 查詢中...")
-            def _weather():
-                info = get_weather(city)
-                content = f"{text}\n\n[即時天氣]\n{info}"
-                ans = ask_groq(uid, content, model=MODEL_FAST)
-                push(uid, f"{info}\n\n{ans}")
-            threading.Thread(target=_weather, daemon=True).start()
-            return
+        reply(event.reply_token, "🔍 查詢中...")
+        def _weather():
+            location = extract_location_ai(text)
+            if not location:
+                push(uid, "⚠️ 請指定地點，例如：台北天氣、小港區幾度")
+                return
+            info = get_weather(location)
+            content = f"{text}\n\n[即時天氣]\n{info}"
+            ans = ask_groq(uid, content, model=MODEL_FAST)
+            push(uid, f"{info}\n\n{ans}")
+        threading.Thread(target=_weather, daemon=True).start()
+        return
 
     # ── B1 鋼筋混凝土規範查詢 ─────────────────────────────────────────────────
     if rebar_query.is_reg_query(text):
