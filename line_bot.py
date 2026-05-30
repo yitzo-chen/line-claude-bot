@@ -211,19 +211,29 @@ def get_weather(location: str) -> str:
     if not geo:
         return f"⚠️ 找不到「{location}」的地點資料"
     lat, lon, display_name = geo
+    params = {"lat": lat, "lon": lon, "appid": OPENWEATHER_API_KEY,
+              "units": "metric", "lang": "zh_tw"}
     try:
-        r = requests.get(
-            "https://api.openweathermap.org/data/2.5/weather",
-            params={"lat": lat, "lon": lon, "appid": OPENWEATHER_API_KEY,
-                    "units": "metric", "lang": "zh_tw"},
-            timeout=10,
-        )
+        r = requests.get("https://api.openweathermap.org/data/2.5/weather",
+                         params=params, timeout=10)
         r.raise_for_status()
         d = r.json()
+
+        # 從預報取最近一筆降雨機率
+        pop_str = ""
+        try:
+            rf = requests.get("https://api.openweathermap.org/data/2.5/forecast",
+                              params={**params, "cnt": 2}, timeout=10)
+            pop = rf.json()["list"][0].get("pop", 0)
+            pop_str = f"\n🌧 降雨機率 {round(pop * 100)}%"
+        except Exception:
+            pass
+
         return (f"📍 {display_name}\n"
                 f"🌤 {d['weather'][0]['description']}\n"
                 f"🌡 {d['main']['temp']}°C（體感 {d['main']['feels_like']}°C）\n"
-                f"💧 濕度 {d['main']['humidity']}%")
+                f"💧 濕度 {d['main']['humidity']}%"
+                f"{pop_str}")
     except Exception as e:
         return f"查詢失敗：{e}"
 
