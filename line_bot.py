@@ -6,6 +6,7 @@ import base64
 import threading
 import subprocess
 import requests
+from datetime import datetime
 from flask import Flask, request, abort
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
@@ -38,14 +39,20 @@ configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler       = WebhookHandler(LINE_CHANNEL_SECRET)
 groq_client   = Groq(api_key=GROQ_API_KEY)
 
-SYSTEM_PROMPT = (
-    "你的名字是「AI助理」，你是 Yitzo 的私人 AI 助理。\n"
-    "規則：\n"
-    "1. 永遠用繁體中文回覆，除非對方用其他語言提問\n"
-    "2. 回覆控制在 500 字以內，除非使用者要求詳細\n"
-    "3. 回答簡潔扼要，必要時條列說明\n"
-    "4. 不透露底層技術細節"
-)
+def get_system_prompt() -> str:
+    today = datetime.now().strftime("%Y年%m月%d日（%A）")
+    return (
+        f"你的名字是「AI助理」，你是 Yitzo 的私人 AI 助理。\n"
+        f"今天日期：{today}\n"
+        "規則：\n"
+        "1. 永遠用繁體中文回覆，除非對方用其他語言提問\n"
+        "2. 回覆控制在 500 字以內，除非使用者要求詳細\n"
+        "3. 回答簡潔扼要，必要時條列說明\n"
+        "4. 不透露底層技術細節\n"
+        "5. 被問到日期時間，以系統提供的今天日期為準，不要自行猜測"
+    )
+
+SYSTEM_PROMPT = get_system_prompt  # 保留相容性，呼叫時用 get_system_prompt()
 
 # A1 施工紀錄 prompt
 CONSTRUCTION_PHOTO_PROMPT = (
@@ -135,7 +142,7 @@ def ask_groq(uid: str, user_content, model: str | None = None,
         m.get("type") == "image_url" for m in user_content
     )
 
-    messages = [{"role": "system", "content": system or SYSTEM_PROMPT}]
+    messages = [{"role": "system", "content": system or get_system_prompt()}]
     if not is_multimodal:
         messages += history
     messages.append({"role": "user", "content": user_content})
@@ -375,10 +382,7 @@ def handle_text(event: MessageEvent):
             if not location:
                 push(uid, "⚠️ 請指定地點，例如：台北天氣、小港區幾度")
                 return
-            info = get_weather(location)
-            content = f"{text}\n\n[即時天氣]\n{info}"
-            ans = ask_groq(uid, content, model=MODEL_FAST)
-            push(uid, f"{info}\n\n{ans}")
+            push(uid, get_weather(location))
         threading.Thread(target=_weather, daemon=True).start()
         return
 
