@@ -278,7 +278,7 @@ def run_claude_cli(prompt: str) -> str:
 # ── Webhook 路由 ──────────────────────────────────────────────────────────────
 @app.route("/health")
 def health():
-    return "OK"
+    return "OK v2-geocoding"
 
 
 @app.route("/callback", methods=["POST"])
