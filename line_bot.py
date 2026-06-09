@@ -1,9 +1,9 @@
 import os
 import time
-import base64
 import threading
 import subprocess
 import requests
+import httpx
 from datetime import datetime
 from flask import Flask, request, abort
 from linebot.v3 import WebhookHandler
@@ -16,7 +16,8 @@ from linebot.v3.webhooks import (
     MessageEvent, TextMessageContent,
     ImageMessageContent, FileMessageContent,
 )
-from groq import Groq
+from google import genai
+from google.genai import types
 import rebar_query
 
 app = Flask(__name__)
@@ -24,18 +25,19 @@ app = Flask(__name__)
 # ── 環境變數 ──────────────────────────────────────────────────────────────────
 LINE_CHANNEL_ACCESS_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
 LINE_CHANNEL_SECRET       = os.environ["LINE_CHANNEL_SECRET"]
-GROQ_API_KEY              = os.environ["GROQ_API_KEY"]
+GEMINI_API_KEY            = os.environ["GEMINI_API_KEY"]
 OWNER_USER_ID             = os.environ.get("LINE_USER_ID", "")
 OPENWEATHER_API_KEY       = os.environ.get("OPENWEATHER_API_KEY", "")
 
-# Groq 模型
-MODEL_TEXT   = "llama-3.3-70b-versatile"
-MODEL_FAST   = "llama-3.1-8b-instant"
-MODEL_VISION = "meta-llama/llama-4-scout-17b-16e-instruct"
+GEMINI_MODEL = "gemini-2.5-flash"
 
-configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
-handler       = WebhookHandler(LINE_CHANNEL_SECRET)
-groq_client   = Groq(api_key=GROQ_API_KEY)
+configuration  = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
+handler        = WebhookHandler(LINE_CHANNEL_SECRET)
+# verify=False 解決部分企業網路 SSL 攔截問題
+gemini_client  = genai.Client(
+    api_key=GEMINI_API_KEY,
+    http_options=types.HttpOptions(httpx_client=httpx.Client(verify=False)),
+)
 
 _WEEKDAY_ZH = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
 
@@ -64,13 +66,8 @@ CONSTRUCTION_PHOTO_PROMPT = (
 )
 
 
-def select_model(text: str = "") -> str:
-    if len(text) < 30:
-        return MODEL_FAST
-    return MODEL_TEXT
-
-
-# ── 對話歷史（in-memory）────────────────────────────────────────────────────
+# ── 對話歷史（in-memory，Gemini 格式）──────────────────────────────────────
+# 格式：[{"role": "user"/"model", "parts": [{"text": "..."}]}, ...]
 conversation_history: dict[str, list] = {}
 HISTORY_LIMIT = 12
 HISTORY_TTL   = 2 * 3600
@@ -133,34 +130,33 @@ def push(uid: str, text: str):
                                messages=[TextMessage(text=text[:5000])]))
 
 
-# ── Groq API ──────────────────────────────────────────────────────────────────
-def ask_groq(uid: str, user_content, model: str | None = None,
-             system: str | None = None) -> str:
-    chosen = model or MODEL_TEXT
+# ── Gemini API ────────────────────────────────────────────────────────────────
+def ask_gemini(uid: str, user_text: str, system: str | None = None) -> str:
     history = get_history(uid)
-
-    # 圖片訊息不存入歷史（Groq 不支援多輪圖片）
-    is_multimodal = isinstance(user_content, list) and any(
-        m.get("type") == "image_url" for m in user_content
+    contents = history + [{"role": "user", "parts": [{"text": user_text}]}]
+    config = types.GenerateContentConfig(
+        system_instruction=system or get_system_prompt(),
+        max_output_tokens=1024,
     )
-
-    messages = [{"role": "system", "content": system or get_system_prompt()}]
-    if not is_multimodal:
-        messages += history
-    messages.append({"role": "user", "content": user_content})
-
-    resp = groq_client.chat.completions.create(
-        model=chosen,
-        messages=messages,
-        max_tokens=1024,
+    resp = gemini_client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=contents,
+        config=config,
     )
-    answer = resp.choices[0].message.content
-
-    if not is_multimodal:
-        history.append({"role": "user", "content": user_content})
-        history.append({"role": "assistant", "content": answer})
-        save_history(uid, history)
+    answer = resp.text
+    history.append({"role": "user",  "parts": [{"text": user_text}]})
+    history.append({"role": "model", "parts": [{"text": answer}]})
+    save_history(uid, history)
     return answer
+
+
+def ask_gemini_image(img_bytes: bytes, mime: str, prompt: str) -> str:
+    img_part = types.Part.from_bytes(data=img_bytes, mime_type=mime)
+    resp = gemini_client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=[img_part, prompt],
+    )
+    return resp.text
 
 
 # ── 天氣 ──────────────────────────────────────────────────────────────────────
@@ -175,28 +171,23 @@ def is_weather(text: str) -> bool:
 
 
 def extract_location_ai(text: str) -> str | None:
-    """用 Groq 從口語句子中抽取地點名稱"""
     try:
-        resp = groq_client.chat.completions.create(
-            model=MODEL_FAST,
-            messages=[{
-                "role": "user",
-                "content": (
-                    "從以下句子抽取地點名稱（城市、區、鄉鎮皆可），"
-                    "只輸出地點本身（例：小港區、台北、東京），"
-                    "完全無法判斷才輸出「NULL」：\n" + text
-                ),
-            }],
-            max_tokens=20,
+        resp = gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=(
+                "從以下句子抽取地點名稱（城市、區、鄉鎮皆可），"
+                "只輸出地點本身（例：小港區、台北、東京），"
+                "完全無法判斷才輸出「NULL」：\n" + text
+            ),
+            config=types.GenerateContentConfig(max_output_tokens=20),
         )
-        loc = resp.choices[0].message.content.strip().translate(_STRIP_PUNCT)
+        loc = resp.text.strip().translate(_STRIP_PUNCT)
         return None if loc == "NULL" or not loc else loc
     except Exception:
         return None
 
 
 def geocode_location(location: str) -> tuple[float, float, str] | None:
-    """用 OWM Geocoding API 將地名轉座標，優先加 TW 後綴"""
     if not OPENWEATHER_API_KEY:
         return None
     for query in [f"{location},TW", location]:
@@ -337,7 +328,7 @@ def handle_text(event: MessageEvent):
         hist_len = len(conversation_history.get(uid, []))
         reply(event.reply_token,
               f"🤖 AI助理 運作中\n"
-              f"引擎：Groq（免費）\n"
+              f"引擎：Gemini 2.5 Flash（免費）\n"
               f"對話歷史：{hist_len // 2} 則\n"
               f"遠端控制：{'✅ 已啟用' if is_owner(uid) else '❌ 僅限擁有者'}")
         return
@@ -391,8 +382,7 @@ def handle_text(event: MessageEvent):
         def _reg():
             try:
                 msg = rebar_query.build_query_message(text)
-                ans = ask_groq(uid, msg, model=MODEL_TEXT,
-                               system=rebar_query.REG_SYSTEM)
+                ans = ask_gemini(uid, msg, system=rebar_query.REG_SYSTEM)
                 push(uid, ans + rebar_query.VERSION_NOTE)
             except Exception as e:
                 push(uid, f"⚠️ 規範查詢錯誤：{e}")
@@ -402,7 +392,7 @@ def handle_text(event: MessageEvent):
     # ── 一般 AI 對話 ──────────────────────────────────────────────────────────
     def _chat():
         try:
-            ans = ask_groq(uid, text, model=select_model(text))
+            ans = ask_gemini(uid, text)
             push(uid, ans)
         except Exception as e:
             push(uid, f"⚠️ 錯誤：{e}")
@@ -427,13 +417,8 @@ def handle_image(event: MessageEvent):
             headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
             img_resp = requests.get(url, headers=headers, timeout=30)
             img_resp.raise_for_status()
-            b64 = base64.standard_b64encode(img_resp.content).decode()
-            content = [
-                {"type": "image_url",
-                 "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-                {"type": "text", "text": CONSTRUCTION_PHOTO_PROMPT},
-            ]
-            ans = ask_groq(uid, content, model=MODEL_VISION)
+            ans = ask_gemini_image(img_resp.content, "image/jpeg",
+                                   CONSTRUCTION_PHOTO_PROMPT)
             push(uid, f"📋 {ans}")
         except Exception as e:
             push(uid, f"⚠️ 圖片分析失敗：{e}")
@@ -467,9 +452,8 @@ def handle_file(event: MessageEvent):
             raw_resp = requests.get(url, headers=headers, timeout=30)
             raw_resp.raise_for_status()
             content = raw_resp.content.decode("utf-8", errors="replace")
-            ans = ask_groq(uid,
-                           f"檔案 `{name}` 內容：\n\n{content[:8000]}\n\n請用繁體中文摘要重點。",
-                           model=MODEL_TEXT)
+            ans = ask_gemini(uid,
+                             f"檔案 `{name}` 內容：\n\n{content[:8000]}\n\n請用繁體中文摘要重點。")
             push(uid, ans)
         except Exception as e:
             push(uid, f"⚠️ 檔案分析失敗：{e}")
