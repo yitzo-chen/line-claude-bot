@@ -93,8 +93,9 @@ _seen: dict[str, float] = {}
 
 
 def is_duplicate(mid: str) -> bool:
+    global _seen
     now = time.time()
-    _seen.update({k: v for k, v in _seen.items() if now - v < 60})
+    _seen = {k: v for k, v in _seen.items() if now - v < 60}
     if mid in _seen:
         return True
     _seen[mid] = now
@@ -184,7 +185,7 @@ def is_weather(text: str) -> bool:
 
 def extract_location_ai(text: str) -> str | None:
     try:
-        resp = gemini_client.models.generate_content(
+        resp = _gemini_call_with_retry(lambda: gemini_client.models.generate_content(
             model=GEMINI_MODEL,
             contents=(
                 "從以下句子抽取地點名稱（城市、區、鄉鎮皆可），"
@@ -192,7 +193,7 @@ def extract_location_ai(text: str) -> str | None:
                 "完全無法判斷才輸出「NULL」：\n" + text
             ),
             config=types.GenerateContentConfig(max_output_tokens=20),
-        )
+        ))
         loc = resp.text.strip().translate(_STRIP_PUNCT)
         return None if loc == "NULL" or not loc else loc
     except Exception:
