@@ -131,6 +131,18 @@ def push(uid: str, text: str):
 
 
 # ── Gemini API ────────────────────────────────────────────────────────────────
+def _gemini_call_with_retry(fn, retries=3, base_delay=5):
+    """503 過載時自動 retry，間隔 5s / 10s / 20s"""
+    for attempt in range(retries):
+        try:
+            return fn()
+        except Exception as e:
+            if "503" in str(e) and attempt < retries - 1:
+                time.sleep(base_delay * (2 ** attempt))
+            else:
+                raise
+
+
 def ask_gemini(uid: str, user_text: str, system: str | None = None) -> str:
     history = get_history(uid)
     contents = history + [{"role": "user", "parts": [{"text": user_text}]}]
@@ -138,11 +150,11 @@ def ask_gemini(uid: str, user_text: str, system: str | None = None) -> str:
         system_instruction=system or get_system_prompt(),
         max_output_tokens=1024,
     )
-    resp = gemini_client.models.generate_content(
+    resp = _gemini_call_with_retry(lambda: gemini_client.models.generate_content(
         model=GEMINI_MODEL,
         contents=contents,
         config=config,
-    )
+    ))
     answer = resp.text
     history.append({"role": "user",  "parts": [{"text": user_text}]})
     history.append({"role": "model", "parts": [{"text": answer}]})
@@ -152,10 +164,10 @@ def ask_gemini(uid: str, user_text: str, system: str | None = None) -> str:
 
 def ask_gemini_image(img_bytes: bytes, mime: str, prompt: str) -> str:
     img_part = types.Part.from_bytes(data=img_bytes, mime_type=mime)
-    resp = gemini_client.models.generate_content(
+    resp = _gemini_call_with_retry(lambda: gemini_client.models.generate_content(
         model=GEMINI_MODEL,
         contents=[img_part, prompt],
-    )
+    ))
     return resp.text
 
 
