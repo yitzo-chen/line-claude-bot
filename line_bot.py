@@ -1,5 +1,6 @@
 import os
 import time
+import sqlite3
 import threading
 import subprocess
 import requests
@@ -88,18 +89,28 @@ def save_history(uid: str, history: list):
     _last_active[uid] = time.time()
 
 
-# ── 去重 ──────────────────────────────────────────────────────────────────────
-_seen: dict[str, float] = {}
+# ── 去重（SQLite，跨 gunicorn worker 共用，避免冷啟動時 LINE 重送 webhook 被不同 worker 各自放行）──
+_DEDUP_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dedup.db")
+_dedup_lock = threading.Lock()
+
+
+def _dedup_conn():
+    conn = sqlite3.connect(_DEDUP_DB, timeout=5)
+    conn.execute("CREATE TABLE IF NOT EXISTS seen (mid TEXT PRIMARY KEY, ts REAL)")
+    return conn
 
 
 def is_duplicate(mid: str) -> bool:
-    global _seen
     now = time.time()
-    _seen = {k: v for k, v in _seen.items() if now - v < 60}
-    if mid in _seen:
-        return True
-    _seen[mid] = now
-    return False
+    with _dedup_lock:
+        conn = _dedup_conn()
+        try:
+            conn.execute("DELETE FROM seen WHERE ts < ?", (now - 60,))
+            cur = conn.execute("INSERT OR IGNORE INTO seen (mid, ts) VALUES (?, ?)", (mid, now))
+            conn.commit()
+            return cur.rowcount == 0
+        finally:
+            conn.close()
 
 
 # ── Rate limit ────────────────────────────────────────────────────────────────
@@ -133,12 +144,21 @@ def push(uid: str, text: str):
 
 # ── Gemini API ────────────────────────────────────────────────────────────────
 def _gemini_call_with_retry(fn, retries=3, base_delay=5):
-    """503 過載時自動 retry，間隔 5s / 10s / 20s"""
+    """
+    503（過載）：間隔 5s / 10s / 20s 重試
+    429（速率限制）：間隔拉長為 20s / 40s / 80s，讓每分鐘請求數上限有時間重置
+    （冷啟動時 LINE 重送 webhook 疊加請求最容易撞到這個限制，非當日配額用完）
+    """
     for attempt in range(retries):
         try:
             return fn()
         except Exception as e:
-            if "503" in str(e) and attempt < retries - 1:
+            err = str(e)
+            if attempt >= retries - 1:
+                raise
+            if "429" in err:
+                time.sleep(base_delay * 4 * (2 ** attempt))
+            elif "503" in err:
                 time.sleep(base_delay * (2 ** attempt))
             else:
                 raise
