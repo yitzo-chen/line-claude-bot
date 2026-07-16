@@ -31,6 +31,8 @@ OWNER_USER_ID             = os.environ.get("LINE_USER_ID", "")
 OPENWEATHER_API_KEY       = os.environ.get("OPENWEATHER_API_KEY", "")
 
 GEMINI_MODEL = "gemini-2.5-flash"
+# 額度用完時依序降級嘗試（各模型 RPM/RPD 額度分開算，帳號 prepay 額度耗盡則所有模型共用同一池，換模型無效）
+GEMINI_MODEL_CHAIN = [GEMINI_MODEL, "gemini-flash-lite-latest", "gemini-2.0-flash-lite"]
 
 configuration  = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler        = WebhookHandler(LINE_CHANNEL_SECRET)
@@ -142,26 +144,39 @@ def push(uid: str, text: str):
                                messages=[TextMessage(text=text[:5000])]))
 
 
+# ── 錯誤紀錄（推給使用者的錯誤同時印到 stdout，才會出現在 Render Logs）──────────
+def _log_error(context: str, e: Exception):
+    print(f"[ERROR] {context}: {e!r}", flush=True)
+
+
 # ── Gemini API ────────────────────────────────────────────────────────────────
-def _gemini_call_with_retry(fn, retries=3, base_delay=5):
+def _gemini_call_with_retry(build_fn, retries=3, base_delay=5):
     """
-    503（過載）：間隔 5s / 10s / 20s 重試
-    429（速率限制）：間隔拉長為 20s / 40s / 80s，讓每分鐘請求數上限有時間重置
-    （冷啟動時 LINE 重送 webhook 疊加請求最容易撞到這個限制，非當日配額用完）
+    build_fn(model) 依序在 GEMINI_MODEL_CHAIN 各模型上呼叫：
+    503（過載）：同一模型間隔 5s / 10s / 20s 重試
+    429 且訊息含 prepay/credits depleted（帳號額度耗盡，所有模型共用同一池）：直接拋出，換模型無用
+    429 其他情況（單一模型 RPM/RPD 額度打滿）：重試 3 次後改用下一個模型
     """
-    for attempt in range(retries):
-        try:
-            return fn()
-        except Exception as e:
-            err = str(e)
-            if attempt >= retries - 1:
-                raise
-            if "429" in err:
-                time.sleep(base_delay * 4 * (2 ** attempt))
-            elif "503" in err:
-                time.sleep(base_delay * (2 ** attempt))
-            else:
-                raise
+    last_err = None
+    for model in GEMINI_MODEL_CHAIN:
+        for attempt in range(retries):
+            try:
+                return build_fn(model)
+            except Exception as e:
+                err = str(e)
+                last_err = e
+                if "prepay" in err.lower() or "credits are depleted" in err.lower():
+                    raise
+                if "429" in err and attempt < retries - 1:
+                    time.sleep(base_delay * 4 * (2 ** attempt))
+                elif "503" in err and attempt < retries - 1:
+                    time.sleep(base_delay * (2 ** attempt))
+                elif "429" in err or "503" in err:
+                    print(f"[WARN] {model} 額度/過載重試耗盡，改用下一個模型", flush=True)
+                    break
+                else:
+                    raise
+    raise last_err
 
 
 def ask_gemini(uid: str, user_text: str, system: str | None = None) -> str:
@@ -171,8 +186,8 @@ def ask_gemini(uid: str, user_text: str, system: str | None = None) -> str:
         system_instruction=system or get_system_prompt(),
         max_output_tokens=1024,
     )
-    resp = _gemini_call_with_retry(lambda: gemini_client.models.generate_content(
-        model=GEMINI_MODEL,
+    resp = _gemini_call_with_retry(lambda model: gemini_client.models.generate_content(
+        model=model,
         contents=contents,
         config=config,
     ))
@@ -185,8 +200,8 @@ def ask_gemini(uid: str, user_text: str, system: str | None = None) -> str:
 
 def ask_gemini_image(img_bytes: bytes, mime: str, prompt: str) -> str:
     img_part = types.Part.from_bytes(data=img_bytes, mime_type=mime)
-    resp = _gemini_call_with_retry(lambda: gemini_client.models.generate_content(
-        model=GEMINI_MODEL,
+    resp = _gemini_call_with_retry(lambda model: gemini_client.models.generate_content(
+        model=model,
         contents=[img_part, prompt],
     ))
     return resp.text
@@ -205,8 +220,8 @@ def is_weather(text: str) -> bool:
 
 def extract_location_ai(text: str) -> str | None:
     try:
-        resp = _gemini_call_with_retry(lambda: gemini_client.models.generate_content(
-            model=GEMINI_MODEL,
+        resp = _gemini_call_with_retry(lambda model: gemini_client.models.generate_content(
+            model=model,
             contents=(
                 "從以下句子抽取地點名稱（城市、區、鄉鎮皆可），"
                 "只輸出地點本身（例：小港區、台北、東京），"
@@ -418,6 +433,7 @@ def handle_text(event: MessageEvent):
                 ans = ask_gemini(uid, msg, system=rebar_query.REG_SYSTEM)
                 push(uid, ans + rebar_query.VERSION_NOTE)
             except Exception as e:
+                _log_error("規範查詢", e)
                 push(uid, f"⚠️ 規範查詢錯誤：{e}")
         threading.Thread(target=_reg, daemon=True).start()
         return
@@ -428,6 +444,7 @@ def handle_text(event: MessageEvent):
             ans = ask_gemini(uid, text)
             push(uid, ans)
         except Exception as e:
+            _log_error("一般對話", e)
             push(uid, f"⚠️ 錯誤：{e}")
     threading.Thread(target=_chat, daemon=True).start()
 
@@ -454,6 +471,7 @@ def handle_image(event: MessageEvent):
                                    CONSTRUCTION_PHOTO_PROMPT)
             push(uid, f"📋 {ans}")
         except Exception as e:
+            _log_error("圖片分析", e)
             push(uid, f"⚠️ 圖片分析失敗：{e}")
     threading.Thread(target=_img, daemon=True).start()
 
@@ -489,6 +507,7 @@ def handle_file(event: MessageEvent):
                              f"檔案 `{name}` 內容：\n\n{content[:8000]}\n\n請用繁體中文摘要重點。")
             push(uid, ans)
         except Exception as e:
+            _log_error("檔案分析", e)
             push(uid, f"⚠️ 檔案分析失敗：{e}")
     threading.Thread(target=_file, daemon=True).start()
 
