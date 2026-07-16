@@ -154,6 +154,7 @@ def _gemini_call_with_retry(build_fn, retries=3, base_delay=5):
     """
     build_fn(model) 依序在 GEMINI_MODEL_CHAIN 各模型上呼叫：
     503（過載）：同一模型間隔 5s / 10s / 20s 重試
+    404 且訊息含 no longer available（模型已下架）：立即改用下一個模型，不重試
     429 且訊息含 prepay/credits depleted（帳號額度耗盡，所有模型共用同一池）：直接拋出，換模型無用
     429 其他情況（單一模型 RPM/RPD 額度打滿）：重試 3 次後改用下一個模型
     """
@@ -167,6 +168,9 @@ def _gemini_call_with_retry(build_fn, retries=3, base_delay=5):
                 last_err = e
                 if "prepay" in err.lower() or "credits are depleted" in err.lower():
                     raise
+                if "404" in err and "no longer available" in err.lower():
+                    print(f"[WARN] {model} 已下架，改用下一個模型", flush=True)
+                    break
                 if "429" in err and attempt < retries - 1:
                     time.sleep(base_delay * 4 * (2 ** attempt))
                 elif "503" in err and attempt < retries - 1:
