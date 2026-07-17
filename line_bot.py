@@ -30,9 +30,10 @@ GEMINI_API_KEY            = os.environ["GEMINI_API_KEY"]
 OWNER_USER_ID             = os.environ.get("LINE_USER_ID", "")
 OPENWEATHER_API_KEY       = os.environ.get("OPENWEATHER_API_KEY", "")
 
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-flash-lite-latest"
 # 額度用完時依序降級嘗試（各模型 RPM/RPD 額度分開算，帳號 prepay 額度耗盡則所有模型共用同一池，換模型無效）
-GEMINI_MODEL_CHAIN = [GEMINI_MODEL, "gemini-flash-lite-latest", "gemini-2.0-flash-lite"]
+# gemini-2.5-flash 對此帳號的新 key 已下架（404），移除以避免每次多一次無謂失敗
+GEMINI_MODEL_CHAIN = [GEMINI_MODEL, "gemini-2.0-flash-lite"]
 
 configuration  = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler        = WebhookHandler(LINE_CHANNEL_SECRET)
